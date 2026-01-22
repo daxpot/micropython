@@ -412,3 +412,5 @@ void boardctrl_startup(void);
 #ifndef MICROPY_ESP_IDF_ENTRY
 #define MICROPY_ESP_IDF_ENTRY app_main
 #endif
+
+#define MODULE_OPUSMOD_ENABLED
