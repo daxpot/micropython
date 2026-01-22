@@ -517,6 +517,9 @@ static const mp_rom_map_elem_t machine_i2s_locals_dict_table[] = {
     // Constants
     { MP_ROM_QSTR(MP_QSTR_RX),              MP_ROM_INT(MICROPY_PY_MACHINE_I2S_CONSTANT_RX) },
     { MP_ROM_QSTR(MP_QSTR_TX),              MP_ROM_INT(MICROPY_PY_MACHINE_I2S_CONSTANT_TX) },
+    #ifdef MICROPY_PY_MACHINE_I2S_CONSTANT_PDM_RX
+    { MP_ROM_QSTR(MP_QSTR_PDM_RX),          MP_ROM_INT(MICROPY_PY_MACHINE_I2S_CONSTANT_PDM_RX) },
+    #endif
     { MP_ROM_QSTR(MP_QSTR_STEREO),          MP_ROM_INT(STEREO) },
     { MP_ROM_QSTR(MP_QSTR_MONO),            MP_ROM_INT(MONO) },
 };
@@ -525,7 +528,11 @@ MP_DEFINE_CONST_DICT(machine_i2s_locals_dict, machine_i2s_locals_dict_table);
 static mp_uint_t machine_i2s_stream_read(mp_obj_t self_in, void *buf_in, mp_uint_t size, int *errcode) {
     machine_i2s_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
+    #ifdef MICROPY_PY_MACHINE_I2S_CONSTANT_PDM_RX
+    if (self->mode != MICROPY_PY_MACHINE_I2S_CONSTANT_RX && self->mode != MICROPY_PY_MACHINE_I2S_CONSTANT_PDM_RX) {
+    #else
     if (self->mode != MICROPY_PY_MACHINE_I2S_CONSTANT_RX) {
+    #endif
         *errcode = MP_EPERM;
         return MP_STREAM_ERROR;
     }
@@ -623,7 +630,11 @@ static mp_uint_t machine_i2s_ioctl(mp_obj_t self_in, mp_uint_t request, uintptr_
         ret = 0;
 
         if (flags & MP_STREAM_POLL_RD) {
+            #ifdef MICROPY_PY_MACHINE_I2S_CONSTANT_PDM_RX
+            if (self->mode != MICROPY_PY_MACHINE_I2S_CONSTANT_RX && self->mode != MICROPY_PY_MACHINE_I2S_CONSTANT_PDM_RX) {
+            #else
             if (self->mode != MICROPY_PY_MACHINE_I2S_CONSTANT_RX) {
+            #endif
                 *errcode = MP_EPERM;
                 return MP_STREAM_ERROR;
             }
