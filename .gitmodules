@@ -77,3 +77,6 @@
 [submodule "opusmod"]
 	path = modules/opusmod
 	url = https://github.com/zhou19830318/micropython-opusmod.git
+[submodule "ports/esp32/components/esp-ml307"]
+	path = ports/esp32/components/esp-ml307
+	url = https://github.com/78/esp-ml307.git

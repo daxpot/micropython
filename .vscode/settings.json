@@ -1,0 +1,5 @@
+{
+    "clangd.arguments": [
+        "--compile-commands-dir=${workspaceFolder}/ports/esp32/build-ESP32_GENERIC_S3-SPIRAM_OCT"
+    ]
+}
