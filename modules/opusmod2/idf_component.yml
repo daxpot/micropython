@@ -1,0 +1,7 @@
+## IDF Component Manager Manifest File for opusmod2
+## This file declares the dependency on 78/esp-opus-encoder
+## which will automatically pull in 78/esp-opus (the underlying Opus library)
+dependencies:
+  78/esp-opus-encoder: "^2.4.1"
+  idf:
+    version: ">=5.3.0"

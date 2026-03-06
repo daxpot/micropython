@@ -1,13 +1,13 @@
-# This partition table is for devices with 4MiB or more of flash.
-# The first 2MiB is used for bootloader, nvs, phy_init and firmware.
-# The remaining flash is for the user filesystem(s).
+# This partition table is for devices with 16MiB flash.
+# Includes model partition for esp-sr wake word models.
 
 # Notes: the offset of the partition table itself is set in
 # $IDF_PATH/components/partition_table/Kconfig.projbuild.
 # Name,   Type, SubType, Offset,  Size, Flags
 nvs,      data, nvs,     0x9000,  0x6000,
 phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000,   0x2A0000,
+factory,  app,  factory, 0x10000,   0x300000,
 font1,    data, fat,     0x3A0000,  0x60000, 
-font2,    data, fat,     0x400000,  0x40000, 
-vfs,      data, fat,     0x440000,  0xBC0000,
+font2,    data, fat,     0x400000,  0x80000, 
+vfs,      data, fat,     0x480000,  0x780000,
+model,    data, spiffs,  0xC00000,  0x400000,

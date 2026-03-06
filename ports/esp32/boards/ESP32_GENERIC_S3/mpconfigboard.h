@@ -12,3 +12,5 @@
 
 #define MICROPY_HW_I2C0_SCL                 (9)
 #define MICROPY_HW_I2C0_SDA                 (8)
+
+#define MICROPY_CAMERA_MODEL_FREENOVE_ESP32S3_CAM     (1)
