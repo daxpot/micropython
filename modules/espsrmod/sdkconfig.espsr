@@ -1,14 +1,7 @@
-CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
-CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
-CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
-CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-16MiB-custom.csv"
-CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
-
 # ESP-SR Configuration for MicroPython
 # This file should be appended to sdkconfig.defaults or used with menuconfig
 
-# Enable ESP-SR components
+# Enable ESP-SR components - disable MultiNet (command recognition)
 CONFIG_SR_MN_EN_NONE=y
 CONFIG_SR_MN_CN_NONE=y
 
@@ -22,3 +15,9 @@ CONFIG_SR_WN_WN9_NIHAOXIAOZHI=n
 
 # Load model from flash partition instead of embedding in firmware
 CONFIG_SR_MODEL_LOAD_FROM_PARTITION=y
+
+# PSRAM is required for ESP-SR (must be enabled in main sdkconfig)
+# Make sure your board has PSRAM and these are set:
+# CONFIG_SPIRAM=y
+# CONFIG_SPIRAM_MODE_OCT=y (for Octal PSRAM)
+# CONFIG_SPIRAM_SPEED_80M=y
