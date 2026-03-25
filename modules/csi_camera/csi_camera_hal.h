@@ -13,8 +13,10 @@
 #include "esp_err.h"
 
 typedef struct csi_camera_config {
-    uint16_t h_res;             // Horizontal resolution (e.g. 800)
-    uint16_t v_res;             // Vertical resolution (e.g. 640)
+    uint16_t h_res;             // Target horizontal resolution (e.g. 320)
+    uint16_t v_res;             // Target vertical resolution (e.g. 240)
+    uint16_t sensor_h_res;      // Actual sensor output h_res (set during init)
+    uint16_t sensor_v_res;      // Actual sensor output v_res (set during init)
     uint8_t  jpeg_quality;      // JPEG quality 1-100
     uint8_t  data_lanes;        // Number of MIPI CSI data lanes (1 or 2)
     uint16_t lane_bitrate_mbps; // Lane bitrate in Mbps
@@ -31,14 +33,17 @@ typedef struct csi_camera {
     void *i2c_bus_handle;   // i2c_master_bus_handle_t
     void *ldo_handle;       // esp_ldo_channel_handle_t
     void *sensor_handle;    // esp_cam_sensor_device_t *
-    uint8_t *frame_buffer;  // RGB frame buffer (PSRAM)
+    uint8_t *frame_buffer;  // RGB frame buffer (PSRAM, sensor resolution)
     size_t frame_buffer_size;
+    uint8_t *crop_buffer;   // Cropped RGB buffer (if crop needed)
+    size_t crop_buffer_size;
     uint8_t *jpeg_buffer;   // JPEG output buffer
     size_t jpeg_buffer_size;
     size_t jpeg_data_size;  // Actual JPEG data size after encoding
     int init_step;          // Last completed init step (for debugging)
     bool initialized;
     bool frame_captured;
+    bool needs_crop;        // True if target != sensor resolution
 } csi_camera_t;
 
 // Initialize camera (CSI + sensor + ISP + JPEG encoder)

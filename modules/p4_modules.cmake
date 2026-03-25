@@ -4,3 +4,4 @@
 
 include(${CMAKE_CURRENT_LIST_DIR}/opusmod2/micropython.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/csi_camera/micropython.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/mp_jpeg/micropython.cmake)

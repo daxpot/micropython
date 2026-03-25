@@ -130,7 +130,7 @@ static mp_obj_t csi_camera_get_initialized(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(csi_camera_get_initialized_obj, csi_camera_get_initialized);
 
-// Property: cam.resolution -> (h_res, v_res)
+// Property: cam.resolution -> (h_res, v_res) — actual output resolution
 static mp_obj_t csi_camera_get_resolution(mp_obj_t self_in) {
     csi_camera_obj_t *self = MP_OBJ_TO_PTR(self_in);
     mp_obj_t items[2] = {
@@ -141,6 +141,17 @@ static mp_obj_t csi_camera_get_resolution(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(csi_camera_get_resolution_obj, csi_camera_get_resolution);
 
+// Property: cam.sensor_resolution -> (h_res, v_res) — sensor native resolution
+static mp_obj_t csi_camera_get_sensor_resolution(mp_obj_t self_in) {
+    csi_camera_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    mp_obj_t items[2] = {
+        mp_obj_new_int(self->cam.config.sensor_h_res),
+        mp_obj_new_int(self->cam.config.sensor_v_res),
+    };
+    return mp_obj_new_tuple(2, items);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(csi_camera_get_sensor_resolution_obj, csi_camera_get_sensor_resolution);
+
 // Method table
 static const mp_rom_map_elem_t csi_camera_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_init),          MP_ROM_PTR(&csi_camera_obj_init_obj) },
@@ -149,6 +160,7 @@ static const mp_rom_map_elem_t csi_camera_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_deinit),        MP_ROM_PTR(&csi_camera_obj_deinit_obj) },
     { MP_ROM_QSTR(MP_QSTR_initialized),   MP_ROM_PTR(&csi_camera_get_initialized_obj) },
     { MP_ROM_QSTR(MP_QSTR_resolution),    MP_ROM_PTR(&csi_camera_get_resolution_obj) },
+    { MP_ROM_QSTR(MP_QSTR_sensor_resolution), MP_ROM_PTR(&csi_camera_get_sensor_resolution_obj) },
 };
 static MP_DEFINE_CONST_DICT(csi_camera_locals_dict, csi_camera_locals_dict_table);
 

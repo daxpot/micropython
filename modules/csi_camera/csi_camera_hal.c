@@ -141,23 +141,47 @@ static esp_err_t init_sensor(csi_camera_t *cam)
     esp_cam_sensor_format_array_t fmt_array = {0};
     esp_cam_sensor_query_format(sensor, &fmt_array);
 
-    // Try to find a RAW8 format matching resolution, or use first available
+    // Find a suitable format:
+    // 1. Try exact match with target resolution
+    // 2. If not found, find smallest RAW8 format that covers the target
+    // 3. Fallback to first available format
     esp_cam_sensor_format_t *best_fmt = NULL;
+    esp_cam_sensor_format_t *smallest_covering = NULL;
+    uint32_t smallest_area = UINT32_MAX;
     char target_fmt[64];
     snprintf(target_fmt, sizeof(target_fmt), "MIPI_2lane_24Minput_RAW8_%dx%d",
              cam->config.h_res, cam->config.v_res);
 
     for (int i = 0; i < fmt_array.count; i++) {
-        ESP_LOGI(TAG, "sensor format[%d]: %s", i, fmt_array.format_array[i].name);
+        ESP_LOGI(TAG, "sensor format[%d]: %s (%dx%d)", i,
+                 fmt_array.format_array[i].name,
+                 fmt_array.format_array[i].width,
+                 fmt_array.format_array[i].height);
+        // Exact match
         if (strstr(fmt_array.format_array[i].name, target_fmt)) {
             best_fmt = (esp_cam_sensor_format_t *)&fmt_array.format_array[i];
             break;
         }
+        // Track smallest RAW8 format that covers the target
+        if (strstr(fmt_array.format_array[i].name, "RAW8") &&
+            fmt_array.format_array[i].width >= cam->config.h_res &&
+            fmt_array.format_array[i].height >= cam->config.v_res) {
+            uint32_t area = fmt_array.format_array[i].width * fmt_array.format_array[i].height;
+            if (area < smallest_area) {
+                smallest_area = area;
+                smallest_covering = (esp_cam_sensor_format_t *)&fmt_array.format_array[i];
+            }
+        }
+    }
+
+    if (!best_fmt && smallest_covering) {
+        best_fmt = smallest_covering;
+        ESP_LOGE(TAG, "exact format not found, using covering: %s", best_fmt->name);
     }
 
     if (!best_fmt && fmt_array.count > 0) {
         best_fmt = (esp_cam_sensor_format_t *)&fmt_array.format_array[0];
-        ESP_LOGW(TAG, "exact format not found, using: %s", best_fmt->name);
+        ESP_LOGE(TAG, "no covering format, using first: %s", best_fmt->name);
     }
 
     if (!best_fmt) {
@@ -171,15 +195,23 @@ static esp_err_t init_sensor(csi_camera_t *cam)
         return ret;
     }
 
-    // Update config to match actual sensor output resolution
-    if (cam->config.h_res != best_fmt->width || cam->config.v_res != best_fmt->height) {
-        ESP_LOGE(TAG, "resolution adjusted: %dx%d -> %dx%d (sensor format: %s)",
-                 cam->config.h_res, cam->config.v_res,
-                 best_fmt->width, best_fmt->height, best_fmt->name);
-        cam->config.h_res = best_fmt->width;
-        cam->config.v_res = best_fmt->height;
+    // Store actual sensor resolution (may differ from target)
+    cam->config.sensor_h_res = best_fmt->width;
+    cam->config.sensor_v_res = best_fmt->height;
+
+    // Determine if cropping is needed
+    cam->needs_crop = (cam->config.h_res != best_fmt->width ||
+                       cam->config.v_res != best_fmt->height);
+    if (cam->needs_crop) {
+        // Validate target fits within sensor output
+        if (cam->config.h_res > best_fmt->width || cam->config.v_res > best_fmt->height) {
+            ESP_LOGE(TAG, "target %dx%d exceeds sensor %dx%d, adjusting",
+                     cam->config.h_res, cam->config.v_res, best_fmt->width, best_fmt->height);
+            cam->config.h_res = best_fmt->width;
+            cam->config.v_res = best_fmt->height;
+            cam->needs_crop = false;
+        }
     }
-    ESP_LOGE(TAG, "sensor format set: %s (%dx%d)", best_fmt->name, best_fmt->width, best_fmt->height);
 
     // NOTE: Do NOT start stream here — CSI/ISP must be ready first.
     // Stream will be started after CSI and ISP are initialized.
@@ -218,8 +250,10 @@ esp_err_t csi_camera_init(csi_camera_t *cam)
     ret = init_sensor(cam);
     if (ret != ESP_OK) { cam->init_step = 2; return ret; }
 
-    // Step 3: Allocate frame buffer in PSRAM for RGB565 data
-    cam->frame_buffer_size = cam->config.h_res * cam->config.v_res * RGB565_BYTES_PER_PIXEL;
+    // Step 3: Allocate frame buffer in PSRAM (at sensor resolution)
+    uint16_t s_h = cam->config.sensor_h_res;
+    uint16_t s_v = cam->config.sensor_v_res;
+    cam->frame_buffer_size = s_h * s_v * RGB565_BYTES_PER_PIXEL;
     cam->frame_buffer = (uint8_t *)heap_caps_aligned_calloc(64, 1, cam->frame_buffer_size,
                                                              MALLOC_CAP_SPIRAM);
     if (!cam->frame_buffer) {
@@ -227,11 +261,22 @@ esp_err_t csi_camera_init(csi_camera_t *cam)
         return ESP_ERR_NO_MEM;
     }
 
-    // Step 4: CSI controller
+    // Allocate crop buffer if needed
+    if (cam->needs_crop) {
+        cam->crop_buffer_size = cam->config.h_res * cam->config.v_res * RGB565_BYTES_PER_PIXEL;
+        cam->crop_buffer = (uint8_t *)heap_caps_aligned_calloc(64, 1, cam->crop_buffer_size,
+                                                                MALLOC_CAP_SPIRAM);
+        if (!cam->crop_buffer) {
+            cam->init_step = 31;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    // Step 4: CSI controller (at sensor resolution)
     esp_cam_ctlr_csi_config_t csi_config = {
         .ctlr_id = 0,
-        .h_res = cam->config.h_res,
-        .v_res = cam->config.v_res,
+        .h_res = s_h,
+        .v_res = s_v,
         .lane_bit_rate_mbps = cam->config.lane_bitrate_mbps,
         .input_data_color_type = CAM_CTLR_COLOR_RAW8,
         .output_data_color_type = CAM_CTLR_COLOR_RGB565,
@@ -262,8 +307,8 @@ esp_err_t csi_camera_init(csi_camera_t *cam)
         .output_data_color_type = ISP_COLOR_RGB565,
         .has_line_start_packet = true,
         .has_line_end_packet = true,
-        .h_res = cam->config.h_res,
-        .v_res = cam->config.v_res,
+        .h_res = s_h,
+        .v_res = s_v,
     };
     ret = esp_isp_new_processor(&isp_config, &isp_handle);
     if (ret != ESP_OK) { cam->init_step = 5; return ret; }
@@ -302,8 +347,14 @@ esp_err_t csi_camera_init(csi_camera_t *cam)
 
     cam->initialized = true;
     cam->frame_captured = false;
-    ESP_LOGI(TAG, "CSI camera initialized: %dx%d, JPEG quality=%d",
-             cam->config.h_res, cam->config.v_res, cam->config.jpeg_quality);
+    if (cam->needs_crop) {
+        ESP_LOGE(TAG, "CSI camera initialized: sensor=%dx%d, crop=%dx%d, JPEG quality=%d",
+                 cam->config.sensor_h_res, cam->config.sensor_v_res,
+                 cam->config.h_res, cam->config.v_res, cam->config.jpeg_quality);
+    } else {
+        ESP_LOGE(TAG, "CSI camera initialized: %dx%d, JPEG quality=%d",
+                 cam->config.h_res, cam->config.v_res, cam->config.jpeg_quality);
+    }
 
     return ESP_OK;
 }
@@ -337,18 +388,49 @@ esp_err_t csi_camera_capture(csi_camera_t *cam)
     // Invalidate cache to ensure JPEG encoder sees fresh DMA-written data
     esp_cache_msync(cam->frame_buffer, cam->frame_buffer_size, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
 
+    // Center crop if target != sensor resolution
+    uint8_t *encode_buf;
+    size_t encode_buf_size;
+    uint16_t encode_w, encode_h;
+
+    if (cam->needs_crop && cam->crop_buffer) {
+        uint16_t s_w = cam->config.sensor_h_res;
+        uint16_t t_w = cam->config.h_res;
+        uint16_t t_h = cam->config.v_res;
+        uint16_t off_x = (s_w - t_w) / 2;
+        uint16_t off_y = (cam->config.sensor_v_res - t_h) / 2;
+        size_t src_stride = s_w * RGB565_BYTES_PER_PIXEL;
+        size_t dst_stride = t_w * RGB565_BYTES_PER_PIXEL;
+
+        for (uint16_t y = 0; y < t_h; y++) {
+            memcpy(cam->crop_buffer + y * dst_stride,
+                   cam->frame_buffer + (off_y + y) * src_stride + off_x * RGB565_BYTES_PER_PIXEL,
+                   dst_stride);
+        }
+
+        encode_buf = cam->crop_buffer;
+        encode_buf_size = cam->crop_buffer_size;
+        encode_w = t_w;
+        encode_h = t_h;
+    } else {
+        encode_buf = cam->frame_buffer;
+        encode_buf_size = cam->frame_buffer_size;
+        encode_w = cam->config.sensor_h_res;
+        encode_h = cam->config.sensor_v_res;
+    }
+
     // Encode RGB565 frame to JPEG using hardware encoder
     jpeg_encode_cfg_t enc_cfg = {
         .src_type = JPEG_ENCODE_IN_FORMAT_RGB565,
         .sub_sample = JPEG_DOWN_SAMPLING_YUV422,
         .image_quality = cam->config.jpeg_quality,
-        .width = cam->config.h_res,
-        .height = cam->config.v_res,
+        .width = encode_w,
+        .height = encode_h,
     };
 
     uint32_t jpeg_size = 0;
     ret = jpeg_encoder_process(cam->jpeg_handle, &enc_cfg,
-                               cam->frame_buffer, cam->frame_buffer_size,
+                               encode_buf, encode_buf_size,
                                cam->jpeg_buffer, cam->jpeg_buffer_size,
                                &jpeg_size);
     if (ret != ESP_OK) {
@@ -420,6 +502,11 @@ esp_err_t csi_camera_deinit(csi_camera_t *cam)
     if (cam->frame_buffer) {
         heap_caps_free(cam->frame_buffer);
         cam->frame_buffer = NULL;
+    }
+
+    if (cam->crop_buffer) {
+        heap_caps_free(cam->crop_buffer);
+        cam->crop_buffer = NULL;
     }
 
     if (cam->jpeg_buffer) {
