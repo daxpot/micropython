@@ -2,7 +2,8 @@
  * csi_camera_hal.h
  *
  * HAL layer for ESP32-P4 MIPI CSI camera with hardware JPEG encoding.
- * Wraps ESP-IDF esp_cam_ctlr_csi + ISP + JPEG encoder APIs.
+ * Uses singleton pattern — hardware is initialized once and reused across
+ * Python object lifetimes (handles script restart without explicit deinit).
  */
 
 #ifndef CSI_CAMERA_HAL_H
@@ -24,8 +25,17 @@ typedef struct csi_camera_config {
     int8_t   sccb_scl_io;      // SCCB SCL GPIO (-1 for default)
 } csi_camera_config_t;
 
+typedef struct csi_camera_color {
+    int  brightness;    // -128 to 127, default 0
+    int  contrast;      // 0 to 255, maps to 0.0~2.0 (128=1.0), default 128
+    int  saturation;    // 0 to 255, maps to 0.0~2.0 (128=1.0), default 128
+    int  hue;           // 0 to 360 degrees, default 0
+    bool enabled;       // Whether ISP color processing is active
+} csi_camera_color_t;
+
 typedef struct csi_camera {
     csi_camera_config_t config;
+    csi_camera_color_t color;
     void *cam_handle;       // esp_cam_ctlr_handle_t
     void *isp_handle;       // isp_proc_handle_t
     void *jpeg_handle;      // jpeg_encoder_handle_t
@@ -46,11 +56,13 @@ typedef struct csi_camera {
     bool needs_crop;        // True if target != sensor resolution
 } csi_camera_t;
 
-// Initialize camera (CSI + sensor + ISP + JPEG encoder)
+// Get singleton instance (creates if needed, never returns NULL)
+csi_camera_t *csi_camera_get_instance(void);
+
+// Initialize camera — reuses existing hardware if already initialized with compatible config
 esp_err_t csi_camera_init(csi_camera_t *cam);
 
 // Capture one frame and encode to JPEG
-// After calling, cam->jpeg_buffer contains JPEG data of cam->jpeg_data_size bytes
 esp_err_t csi_camera_capture(csi_camera_t *cam);
 
 // Free the captured frame buffer
@@ -58,5 +70,12 @@ void csi_camera_free_buffer(csi_camera_t *cam);
 
 // Deinitialize and release all resources
 esp_err_t csi_camera_deinit(csi_camera_t *cam);
+
+// Set ISP color parameters (can be called anytime after init)
+esp_err_t csi_camera_set_color(csi_camera_t *cam, int brightness, int contrast,
+                                int saturation, int hue);
+
+// Set mirror/flip (can be called anytime after init)
+esp_err_t csi_camera_set_mirror_flip(csi_camera_t *cam, bool hmirror, bool vflip);
 
 #endif // CSI_CAMERA_HAL_H
