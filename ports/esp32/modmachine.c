@@ -39,6 +39,10 @@
 #include "modmachine.h"
 #include "machine_rtc.h"
 
+#if CONFIG_IDF_TARGET_ESP32P4
+#include "esp_ldo_regulator.h"
+#endif
+
 #if MICROPY_HW_ENABLE_SDCARD
 #define MICROPY_PY_MACHINE_SDCARD_ENTRY { MP_ROM_QSTR(MP_QSTR_SDCard), MP_ROM_PTR(&machine_sdcard_type) },
 #else
@@ -298,6 +302,20 @@ MP_NORETURN void mp_machine_bootloader(size_t n_args, const mp_obj_t *args) {
 
 void machine_init(void) {
     is_soft_reset = 0;
+
+    #if CONFIG_IDF_TARGET_ESP32P4
+    // Enable LDO channel 4 (3.3V) for SDIO power — required by boards that
+    // power the C6 WiFi module via internal LDO (e.g. DooiRobot).
+    // Harmless on boards where LDO4 is unused (e.g. WaveShare).
+    {
+        esp_ldo_channel_handle_t sdio_ldo = NULL;
+        esp_ldo_channel_config_t ldo_cfg = {
+            .chan_id = 4,
+            .voltage_mv = 3300,
+        };
+        esp_ldo_acquire_channel(&ldo_cfg, &sdio_ldo);
+    }
+    #endif
 }
 
 void machine_deinit(void) {

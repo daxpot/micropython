@@ -121,7 +121,7 @@ dependencies:
     - esp32c61
     version: 1.7.0
   espressif/esp_hosted:
-    component_hash: 53544436deb5fcbfdbf4a8e2c643cdbe31126556781784278c016d674df99cd2
+    component_hash: 404f5a8f9e9bcfbce6c64e0a171e81b4a45acdb22a8c8b44988571d609e91334
     dependencies:
     - name: idf
       require: private
@@ -129,7 +129,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 2.7.0
+    version: 2.11.6
   espressif/esp_new_jpeg:
     component_hash: 2f06f88e94fbc781b26a9be4291ff4ffc88596c90436a1e1358a7a38296b44ae
     dependencies: []
@@ -261,6 +261,6 @@ direct_dependencies:
 - espressif/tinyusb
 - idf
 - waveshare/esp_lcd_jd9365_10_1
-manifest_hash: 2f55e7f6c086bfc760776ec263b5eff5a3884e20c53ea728187584777d8ed15d
+manifest_hash: 4561b1c7743abfa2f594851ca5f7cc00ca073a8665328b644eeadee17ab75512
 target: esp32p4
 version: 2.0.0

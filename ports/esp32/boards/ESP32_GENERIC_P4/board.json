@@ -19,7 +19,8 @@
     "url": "https://www.espressif.com/en/products/modules",
     "variants": {
         "C5_WIFI": "Support for external C5 WiFi/BLE",
-        "C6_WIFI": "Support for external C6 WiFi/BLE"
+        "C6_WIFI": "Support for external C6 WiFi/BLE",
+        "DOOIROBOT": "DooiRobot board with custom C6 SDIO pins"
     },
     "vendor": "Espressif"
 }
