@@ -1,0 +1,871 @@
+/*
+ * ML307R AT Command Engine Implementation
+ *
+ * Background FreeRTOS task reads UART, parses AT responses and URCs.
+ * Socket data arrives via +MIPURC, is HEX-decoded, and stored in ring buffers.
+ * Python thread synchronizes via EventGroups (no polling needed).
+ */
+
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "ml307_at.h"
+#include "ml307_hex.h"
+
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/idf_additions.h"
+
+static const char *TAG = "ML307";
+
+/* ---- Logging callback (outputs to MicroPython console) ---- */
+static ml307_log_fn_t s_log_fn = NULL;
+
+void ml307_set_log_fn(ml307_log_fn_t fn) {
+    s_log_fn = fn;
+}
+
+/* Log macro: uses callback if set, otherwise falls back to printf. */
+#define ML307_LOGF(fmt, ...) do { \
+    if (s_log_fn) { s_log_fn(fmt, ##__VA_ARGS__); } \
+    else { printf(fmt, ##__VA_ARGS__); } \
+} while(0)
+
+/* ---- Ring Buffer Helpers ---- */
+
+static inline int ringbuf_available(ml307_sock_t *sk) {
+    int avail = sk->rx_head - sk->rx_tail;
+    if (avail < 0) avail += ML307_SOCK_RXBUF_SIZE;
+    return avail;
+}
+
+static void ringbuf_write(ml307_sock_t *sk, const uint8_t *data, int len) {
+    for (int i = 0; i < len; i++) {
+        int next = (sk->rx_head + 1) % ML307_SOCK_RXBUF_SIZE;
+        if (next == sk->rx_tail) {
+            /* Buffer full — drop oldest byte */
+            sk->rx_tail = (sk->rx_tail + 1) % ML307_SOCK_RXBUF_SIZE;
+        }
+        sk->rx_buf[sk->rx_head] = data[i];
+        sk->rx_head = next;
+    }
+}
+
+static int ringbuf_read(ml307_sock_t *sk, uint8_t *buf, int maxlen) {
+    int avail = ringbuf_available(sk);
+    if (avail == 0) return 0;
+    int n = (avail < maxlen) ? avail : maxlen;
+    for (int i = 0; i < n; i++) {
+        buf[i] = sk->rx_buf[sk->rx_tail];
+        sk->rx_tail = (sk->rx_tail + 1) % ML307_SOCK_RXBUF_SIZE;
+    }
+    return n;
+}
+
+/* ---- URC Handlers ---- */
+
+/* +MIPURC: "rtcp",<id>,<len>,<hex_data>
+ * +MIPURC: "rudp",<id>,<len>,<hex_data>
+ * +MIPURC: "disconn",<id> */
+static void handle_mipurc(ml307_state_t *s, const char *args) {
+    const char *p = args;
+    while (*p == ' ') p++;
+
+    /* Parse type string */
+    if (*p != '"') return;
+    p++;
+    char type[16];
+    int ti = 0;
+    while (*p && *p != '"' && ti < (int)sizeof(type) - 1) {
+        type[ti++] = *p++;
+    }
+    type[ti] = '\0';
+    if (*p == '"') p++;
+    if (*p == ',') p++;
+
+    /* Parse socket ID */
+    int sid = atoi(p);
+    if (sid < 0 || sid >= ML307_MAX_SOCKETS) return;
+
+    if (strcmp(type, "rtcp") == 0 || strcmp(type, "rudp") == 0) {
+        /* Skip to data_len field */
+        while (*p && *p != ',') p++;
+        if (*p == ',') p++;
+        /* int data_len = atoi(p); — we derive actual len from hex string */
+
+        /* Skip to hex data */
+        while (*p && *p != ',') p++;
+        if (*p == ',') p++;
+
+        /* Decode hex data directly into ring buffer */
+        int hex_len = strlen(p);
+        if (hex_len < 2) return;
+
+        /* Temporary decode buffer on stack (max ~730 bytes per URC) */
+        uint8_t decode_buf[1024];
+        int decode_len = hex_len / 2;
+        if (decode_len > (int)sizeof(decode_buf)) {
+            decode_len = sizeof(decode_buf);
+        }
+        ml307_hex_decode(p, decode_len * 2, decode_buf);
+
+        xSemaphoreTake(s->sock[sid].mutex, portMAX_DELAY);
+        ringbuf_write(&s->sock[sid], decode_buf, decode_len);
+        xSemaphoreGive(s->sock[sid].mutex);
+
+        xEventGroupSetBits(s->sock[sid].event, SOCK_EVT_DATA);
+
+        if (s->debug) {
+            ESP_LOGI(TAG, "URC rtcp sid=%d len=%d", sid, decode_len);
+        }
+    } else if (strcmp(type, "disconn") == 0) {
+        s->sock[sid].disconnected = true;
+        xEventGroupSetBits(s->sock[sid].event, SOCK_EVT_DISCONN | SOCK_EVT_DATA);
+        if (s->debug) {
+            ESP_LOGI(TAG, "URC disconn sid=%d", sid);
+        }
+    }
+}
+
+/* +MIPOPEN: <id>,<result>  (0=success) */
+static void handle_mipopen(ml307_state_t *s, const char *args) {
+    const char *p = args;
+    while (*p == ' ') p++;
+    int sid = atoi(p);
+    while (*p && *p != ',') p++;
+    if (*p == ',') p++;
+    int result = atoi(p);
+
+    if (sid >= 0 && sid < ML307_MAX_SOCKETS) {
+        s->sock[sid].open_result = result;
+        if (result == 0) {
+            s->sock[sid].state = ML307_SOCK_CONNECTED;
+            xEventGroupSetBits(s->sock[sid].event, SOCK_EVT_CONNECTED);
+        } else {
+            xEventGroupSetBits(s->sock[sid].event, SOCK_EVT_ERROR);
+        }
+        if (s->debug) {
+            ESP_LOGI(TAG, "MIPOPEN sid=%d result=%d", sid, result);
+        }
+    }
+}
+
+/* +MIPCLOSE: <id> */
+static void handle_mipclose(ml307_state_t *s, const char *args) {
+    const char *p = args;
+    while (*p == ' ') p++;
+    int sid = atoi(p);
+    if (sid >= 0 && sid < ML307_MAX_SOCKETS) {
+        s->sock[sid].state = ML307_SOCK_FREE;
+        xEventGroupSetBits(s->sock[sid].event, SOCK_EVT_DISCONN);
+    }
+}
+
+/* +MIPSEND: <id>,<result> */
+static void handle_mipsend(ml307_state_t *s, const char *args) {
+    const char *p = args;
+    while (*p == ' ') p++;
+    int sid = atoi(p);
+    if (sid >= 0 && sid < ML307_MAX_SOCKETS) {
+        xEventGroupSetBits(s->sock[sid].event, SOCK_EVT_SEND_DONE);
+    }
+}
+
+/* ---- Line Processing ---- */
+
+static bool is_urc(const char *line) {
+    return (strncmp(line, "+MIPURC:", 8) == 0 ||
+            strncmp(line, "+MIPOPEN:", 9) == 0 ||
+            strncmp(line, "+MIPCLOSE:", 10) == 0 ||
+            strncmp(line, "+MIPSEND:", 9) == 0);
+}
+
+static void dispatch_urc(ml307_state_t *s, const char *line) {
+    if (strncmp(line, "+MIPURC:", 8) == 0) {
+        handle_mipurc(s, line + 8);
+    } else if (strncmp(line, "+MIPOPEN:", 9) == 0) {
+        handle_mipopen(s, line + 9);
+    } else if (strncmp(line, "+MIPCLOSE:", 10) == 0) {
+        handle_mipclose(s, line + 10);
+    } else if (strncmp(line, "+MIPSEND:", 9) == 0) {
+        handle_mipsend(s, line + 9);
+    }
+}
+
+static void process_line(ml307_state_t *s, const char *line) {
+    /* Skip empty lines */
+    if (line[0] == '\0') return;
+
+    if (s->debug) {
+        ESP_LOGI(TAG, "< %.*s", 120, line);
+    }
+
+    /* URC: dispatch immediately */
+    if (is_urc(line)) {
+        dispatch_urc(s, line);
+        return;
+    }
+
+    /* If waiting for AT response */
+    if (s->at_waiting) {
+        /* Skip echo of sent command */
+        if (s->at_cmd_echo[0] && strcmp(line, s->at_cmd_echo) == 0) {
+            return;
+        }
+
+        /* Append line to response buffer */
+        int line_len = strlen(line);
+        if (s->resp_len + line_len + 2 < ML307_RESP_BUF_SIZE) {
+            if (s->resp_len > 0) {
+                s->resp_buf[s->resp_len++] = '\r';
+                s->resp_buf[s->resp_len++] = '\n';
+            }
+            memcpy(s->resp_buf + s->resp_len, line, line_len);
+            s->resp_len += line_len;
+            s->resp_buf[s->resp_len] = '\0';
+        }
+
+        /* Check for end-of-response markers */
+        if (strcmp(line, "OK") == 0 ||
+            strcmp(line, "ERROR") == 0 ||
+            strncmp(line, "+CME ERROR:", 11) == 0) {
+            xEventGroupSetBits(s->at_event, AT_EVT_RESP_READY);
+        }
+    }
+}
+
+/* Process a byte from UART, accumulate lines */
+static void process_byte(ml307_state_t *s, uint8_t ch) {
+    if (ch == '\r') {
+        /* Ignore CR, wait for LF */
+        return;
+    }
+    if (ch == '\n') {
+        /* End of line */
+        if (s->line_len > 0) {
+            s->line_buf[s->line_len] = '\0';
+            process_line(s, s->line_buf);
+            s->line_len = 0;
+        }
+        return;
+    }
+    /* Append character */
+    if (s->line_len < ML307_LINE_BUF_SIZE - 1) {
+        s->line_buf[s->line_len++] = (char)ch;
+    }
+    /* If buffer full, process what we have and reset */
+    if (s->line_len >= ML307_LINE_BUF_SIZE - 1) {
+        s->line_buf[s->line_len] = '\0';
+        process_line(s, s->line_buf);
+        s->line_len = 0;
+    }
+}
+
+/* ---- Background Task ---- */
+
+static void ml307_at_task(void *arg) {
+    ml307_state_t *s = (ml307_state_t *)arg;
+    uint8_t chunk[512];
+
+    while (s->task_running) {
+        int len = uart_read_bytes(s->uart_num, chunk, sizeof(chunk),
+                                  pdMS_TO_TICKS(50));
+        if (len > 0) {
+            for (int i = 0; i < len; i++) {
+                process_byte(s, chunk[i]);
+            }
+        }
+        /* Yield CPU to let lower-priority tasks (MicroPython) run.
+         * Without this, our high-priority task starves the main task
+         * because uart_read_bytes holds the UART rx_mux. */
+        vTaskDelay(1);
+    }
+    vTaskDelete(NULL);
+}
+
+/* ---- AT Command Send ---- */
+
+int ml307_send_at(ml307_state_t *s, const char *cmd,
+                  char *resp, int resp_size, int timeout_ms) {
+    xSemaphoreTake(s->at_mutex, portMAX_DELAY);
+
+    /* Prepare response state */
+    s->resp_len = 0;
+    s->resp_buf[0] = '\0';
+    xEventGroupClearBits(s->at_event, AT_EVT_RESP_READY);
+
+    /* Store command for echo detection */
+    strncpy(s->at_cmd_echo, cmd, sizeof(s->at_cmd_echo) - 1);
+    s->at_cmd_echo[sizeof(s->at_cmd_echo) - 1] = '\0';
+    s->at_waiting = true;
+
+    /* Send command + CRLF */
+    uart_write_bytes(s->uart_num, cmd, strlen(cmd));
+    uart_write_bytes(s->uart_num, "\r\n", 2);
+
+    /* Wait for response */
+    EventBits_t bits = xEventGroupWaitBits(
+        s->at_event, AT_EVT_RESP_READY,
+        pdTRUE, pdFALSE,
+        pdMS_TO_TICKS(timeout_ms));
+
+    s->at_waiting = false;
+    s->at_cmd_echo[0] = '\0';
+
+    int result;
+    if (!(bits & AT_EVT_RESP_READY)) {
+        result = -1; /* Timeout */
+        if (resp && resp_size > 0) {
+            int len = s->resp_len;
+            if (len >= resp_size) len = resp_size - 1;
+            memcpy(resp, s->resp_buf, len);
+            resp[len] = '\0';
+        }
+    } else {
+        int len = s->resp_len;
+        if (resp && resp_size > 0) {
+            if (len >= resp_size) len = resp_size - 1;
+            memcpy(resp, s->resp_buf, len);
+            resp[len] = '\0';
+        }
+        result = (strstr(s->resp_buf, "OK") != NULL) ? 0 : -2;
+    }
+
+    xSemaphoreGive(s->at_mutex);
+    return result;
+}
+
+/* Convenience: send AT, don't need response */
+static int send_at_ok(ml307_state_t *s, const char *cmd, int timeout_ms) {
+    char resp[256];
+    return ml307_send_at(s, cmd, resp, sizeof(resp), timeout_ms);
+}
+
+/* ---- Modem Initialization ---- */
+
+/* Try to communicate at given baudrate. Returns true if AT->OK works. */
+static bool try_baudrate(ml307_state_t *s, int baud) {
+    uart_set_baudrate(s->uart_num, baud);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    /* Let UART settle after baudrate change. We do NOT call uart_flush_input()
+     * because the background AT task holds the UART rx_mux at higher priority,
+     * which causes uart_flush_input() to deadlock (priority starvation). */
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    char resp[64];
+    for (int i = 0; i < 3; i++) {
+        if (ml307_send_at(s, "AT", resp, sizeof(resp), 500) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int init_modem(ml307_state_t *s, int target_baud, const char *apn) {
+    char resp[256];
+
+    ML307_LOGF("[ML307] Auto-detecting baudrate (target=%d)...\n", target_baud);
+
+    /* Auto-detect baudrate and switch to target */
+    bool found_target = try_baudrate(s, target_baud);
+
+    ML307_LOGF("[ML307] Target baud result=%d\n", found_target);
+
+    if (!found_target) {
+        ML307_LOGF("[ML307] Trying 115200 baud...\n");
+
+        if (!try_baudrate(s, 115200)) {
+            ML307_LOGF("[ML307] ERROR: Modem not responding!\n");
+            return -1;
+        }
+
+        /* Switch to target baudrate */
+        ML307_LOGF("[ML307] Found at 115200, switching to %d...\n", target_baud);
+        if (target_baud != 115200) {
+            char cmd[32];
+            snprintf(cmd, sizeof(cmd), "AT+IPR=%d", target_baud);
+            ml307_send_at(s, cmd, resp, sizeof(resp), 1000);
+            uart_set_baudrate(s->uart_num, target_baud);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            if (!try_baudrate(s, target_baud)) {
+                ML307_LOGF("[ML307] ERROR: Failed to switch baud!\n");
+                return -1;
+            }
+            ML307_LOGF("[ML307] Switched to %d baud OK\n", target_baud);
+        }
+    } else {
+        ML307_LOGF("[ML307] Modem responding at %d baud\n", target_baud);
+    }
+
+    /* Disable echo, enable verbose errors */
+    ML307_LOGF("[ML307] Configuring modem...\n");
+    send_at_ok(s, "ATE0", 1000);
+    send_at_ok(s, "AT+CMEE=2", 1000);
+
+    /* Cleanup any leftover sockets */
+    ML307_LOGF("[ML307] Cleaning up old sockets...\n");
+    for (int i = 0; i < ML307_MAX_SOCKETS; i++) {
+        char cmd[24];
+        snprintf(cmd, sizeof(cmd), "AT+MIPCLOSE=%d", i);
+        ml307_send_at(s, cmd, resp, sizeof(resp), 1000);
+    }
+
+    /* Check SIM card */
+    ML307_LOGF("[ML307] Checking SIM card...\n");
+
+    if (ml307_send_at(s, "AT+CPIN?", resp, sizeof(resp), 5000) != 0 ||
+        strstr(resp, "READY") == NULL) {
+        ML307_LOGF("[ML307] ERROR: SIM not ready: %s\n", resp);
+        return -2;
+    }
+    ML307_LOGF("[ML307] SIM OK\n");
+
+    /* Check signal strength */
+    ML307_LOGF("[ML307] Checking signal...\n");
+
+    if (ml307_send_at(s, "AT+CSQ", resp, sizeof(resp), 3000) == 0) {
+        char *p = strstr(resp, "+CSQ:");
+        if (p) {
+            s->csq = atoi(p + 5);
+            ML307_LOGF("[ML307] Signal CSQ=%d\n", s->csq);
+            if (s->csq < 5 || s->csq == 99) {
+                ML307_LOGF("[ML307] ERROR: Weak signal CSQ=%d\n", s->csq);
+                return -3;
+            }
+        }
+    }
+
+    /* Wait for 4G registration */
+    ML307_LOGF("[ML307] Waiting for 4G registration...\n");
+
+    s->registered = false;
+    for (int i = 0; i < 30; i++) {
+        if (ml307_send_at(s, "AT+CEREG?", resp, sizeof(resp), 3000) == 0) {
+            char *p = strstr(resp, "+CEREG:");
+            if (p) {
+                /* Skip first number (n), get stat */
+                p = strchr(p + 7, ',');
+                if (p) {
+                    int stat = atoi(p + 1);
+                    if (stat == 1 || stat == 5) {
+                        s->registered = true;
+                        ML307_LOGF("[ML307] 4G registered (stat=%d)\n", stat);
+                        break;
+                    }
+                }
+            }
+        }
+        ML307_LOGF(".");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    if (!s->registered) {
+        ML307_LOGF("\n[ML307] ERROR: 4G registration timeout!\n");
+        return -4;
+    }
+
+    /* Set APN and activate PDP */
+    ML307_LOGF("[ML307] Setting APN and activating PDP...\n");
+
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", apn);
+    send_at_ok(s, cmd, 3000);
+    ml307_send_at(s, "AT+CGACT=1,1", resp, sizeof(resp), 15000);
+
+    /* Get IP address */
+    s->ip[0] = '\0';
+    if (ml307_send_at(s, "AT+CGPADDR=1", resp, sizeof(resp), 3000) == 0) {
+        char *p = strstr(resp, "+CGPADDR:");
+        if (p) {
+            p = strchr(p, ',');
+            if (p) {
+                p++; /* skip comma */
+                /* Extract IP, remove quotes */
+                char *dst = s->ip;
+                while (*p && *p != '\r' && *p != '\n' &&
+                       (dst - s->ip) < (int)sizeof(s->ip) - 1) {
+                    if (*p != '"') {
+                        *dst++ = *p;
+                    }
+                    p++;
+                }
+                *dst = '\0';
+            }
+        }
+    }
+
+    if (s->ip[0]) {
+        ML307_LOGF("[ML307] IP: %s\n", s->ip);
+    }
+
+    s->initialized = true;
+    ML307_LOGF("[ML307] Init complete!\n");
+    return 0;
+}
+
+/* ---- Public API: Init/Deinit ---- */
+
+int ml307_init(ml307_state_t *s, int tx_pin, int rx_pin, int baudrate,
+               const char *apn, bool debug) {
+    memset(s, 0, sizeof(*s));
+    s->uart_num = UART_NUM_1;
+    s->tx_pin = tx_pin;
+    s->rx_pin = rx_pin;
+    s->baudrate = baudrate;
+    s->debug = debug;
+
+    /* Create synchronization primitives */
+    ML307_LOGF("[ML307] Creating sync primitives...\n");
+    s->at_mutex = xSemaphoreCreateMutex();
+    s->at_event = xEventGroupCreate();
+    if (!s->at_mutex || !s->at_event) {
+        ML307_LOGF("[ML307] ERROR: Failed to create sync primitives\n");
+        return -1;
+    }
+
+    /* Initialize socket slots */
+    ML307_LOGF("[ML307] Allocating socket buffers...\n");
+    for (int i = 0; i < ML307_MAX_SOCKETS; i++) {
+        s->sock[i].state = ML307_SOCK_FREE;
+        s->sock[i].rx_buf = (uint8_t *)malloc(ML307_SOCK_RXBUF_SIZE);
+        if (!s->sock[i].rx_buf) {
+            ML307_LOGF("[ML307] ERROR: Failed to alloc socket %d buffer\n", i);
+            ml307_deinit(s);
+            return -1;
+        }
+        s->sock[i].rx_head = 0;
+        s->sock[i].rx_tail = 0;
+        s->sock[i].disconnected = false;
+        s->sock[i].open_result = -1;
+        s->sock[i].event = xEventGroupCreate();
+        s->sock[i].mutex = xSemaphoreCreateMutex();
+        if (!s->sock[i].event || !s->sock[i].mutex) {
+            ML307_LOGF("[ML307] ERROR: Failed to create socket %d sync\n", i);
+            ml307_deinit(s);
+            return -1;
+        }
+    }
+
+    /* Setup UART */
+    ML307_LOGF("[ML307] Setting up UART%d (tx=%d, rx=%d)...\n",
+           s->uart_num, tx_pin, rx_pin);
+
+    /* Delete UART driver if already installed (e.g. from previous run or machine.UART) */
+    uart_driver_delete(s->uart_num);
+
+    /* Install UART driver */
+    uart_config_t uart_cfg = {
+        .baud_rate = 115200, /* Start at 115200, switch later if needed */
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    esp_err_t err = uart_param_config(s->uart_num, &uart_cfg);
+    if (err != ESP_OK) {
+        ML307_LOGF("[ML307] ERROR: uart_param_config failed: %d\n", err);
+        ml307_deinit(s);
+        return -1;
+    }
+    err = uart_set_pin(s->uart_num, tx_pin, rx_pin,
+                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (err != ESP_OK) {
+        ML307_LOGF("[ML307] ERROR: uart_set_pin failed: %d\n", err);
+        ml307_deinit(s);
+        return -1;
+    }
+    err = uart_driver_install(s->uart_num,
+                              ML307_UART_RXBUF_SIZE, ML307_UART_TXBUF_SIZE,
+                              0, NULL, 0);
+    if (err != ESP_OK) {
+        ML307_LOGF("[ML307] ERROR: uart_driver_install failed: %d\n", err);
+        ml307_deinit(s);
+        return -1;
+    }
+
+    /* Start background task */
+    ML307_LOGF("[ML307] Starting background AT task...\n");
+    s->task_running = true;
+    BaseType_t ret = xTaskCreatePinnedToCore(
+        ml307_at_task, "ml307_at",
+        6144, s,
+        configMAX_PRIORITIES - 3,
+        &s->task_handle,
+        1  /* Pin to core 1 (MicroPython typically runs on core 0) */
+    );
+    if (ret != pdPASS) {
+        ML307_LOGF("[ML307] ERROR: Failed to create AT task\n");
+        s->task_running = false;
+        ml307_deinit(s);
+        return -1;
+    }
+
+    /* Initialize modem (auto-baud, SIM, 4G, APN) */
+    ML307_LOGF("[ML307] Starting modem init...\n");
+    int rc = init_modem(s, baudrate, apn);
+    if (rc != 0) {
+        ML307_LOGF("[ML307] ERROR: Modem init failed: %d\n", rc);
+        /* Don't deinit — caller may want to retry or debug */
+    }
+    return rc;
+}
+
+void ml307_deinit(ml307_state_t *s) {
+    /* Stop background task — must happen before deleting UART/resources */
+    if (s->task_running) {
+        s->task_running = false;
+        if (s->task_handle) {
+            /* Wait for task to notice task_running=false and exit.
+             * The task checks every 50ms (uart_read_bytes timeout). */
+            vTaskDelay(pdMS_TO_TICKS(300));
+            /* If still alive, force delete */
+            eTaskState state = eTaskGetState(s->task_handle);
+            if (state != eDeleted && state != eInvalid) {
+                vTaskDelete(s->task_handle);
+            }
+            s->task_handle = NULL;
+        }
+    }
+
+    /* Uninstall UART (safe to call even if not installed) */
+    if (s->uart_num > 0) {
+        uart_driver_delete(s->uart_num);
+    }
+
+    /* Free socket resources */
+    for (int i = 0; i < ML307_MAX_SOCKETS; i++) {
+        if (s->sock[i].rx_buf) {
+            free(s->sock[i].rx_buf);
+            s->sock[i].rx_buf = NULL;
+        }
+        if (s->sock[i].event) {
+            vEventGroupDelete(s->sock[i].event);
+            s->sock[i].event = NULL;
+        }
+        if (s->sock[i].mutex) {
+            vSemaphoreDelete(s->sock[i].mutex);
+            s->sock[i].mutex = NULL;
+        }
+    }
+
+    if (s->at_mutex) {
+        vSemaphoreDelete(s->at_mutex);
+        s->at_mutex = NULL;
+    }
+    if (s->at_event) {
+        vEventGroupDelete(s->at_event);
+        s->at_event = NULL;
+    }
+}
+
+/* ---- Public API: Socket Operations ---- */
+
+int ml307_sock_alloc(ml307_state_t *s) {
+    for (int i = 0; i < ML307_MAX_SOCKETS; i++) {
+        if (s->sock[i].state == ML307_SOCK_FREE) {
+            s->sock[i].state = ML307_SOCK_ALLOCATED;
+            s->sock[i].rx_head = 0;
+            s->sock[i].rx_tail = 0;
+            s->sock[i].disconnected = false;
+            s->sock[i].open_result = -1;
+            xEventGroupClearBits(s->sock[i].event,
+                SOCK_EVT_CONNECTED | SOCK_EVT_DISCONN |
+                SOCK_EVT_ERROR | SOCK_EVT_DATA | SOCK_EVT_SEND_DONE);
+            return i;
+        }
+    }
+    return -1; /* No free socket */
+}
+
+void ml307_sock_free(ml307_state_t *s, int sid) {
+    if (sid < 0 || sid >= ML307_MAX_SOCKETS) return;
+    s->sock[sid].state = ML307_SOCK_FREE;
+    s->sock[sid].rx_head = 0;
+    s->sock[sid].rx_tail = 0;
+    s->sock[sid].disconnected = false;
+    s->sock[sid].open_result = -1;
+}
+
+int ml307_sock_connect(ml307_state_t *s, int sid, const char *host, int port,
+                       bool ssl, int timeout_ms) {
+    if (sid < 0 || sid >= ML307_MAX_SOCKETS) return -1;
+    if (s->sock[sid].state < ML307_SOCK_ALLOCATED) return -1;
+
+    char cmd[256];
+    char resp[256];
+
+    /* Configure HEX encoding */
+    snprintf(cmd, sizeof(cmd), "AT+MIPCFG=\"encoding\",%d,1,1", sid);
+    send_at_ok(s, cmd, 1000);
+
+    /* Configure SSL */
+    snprintf(cmd, sizeof(cmd), "AT+MIPCFG=\"ssl\",%d,%d,0", sid, ssl ? 1 : 0);
+    send_at_ok(s, cmd, 1000);
+
+    /* Open connection */
+    s->sock[sid].state = ML307_SOCK_CONNECTING;
+    s->sock[sid].open_result = -1;
+    xEventGroupClearBits(s->sock[sid].event,
+        SOCK_EVT_CONNECTED | SOCK_EVT_ERROR);
+
+    snprintf(cmd, sizeof(cmd),
+             "AT+MIPOPEN=%d,\"TCP\",\"%s\",%d,,0", sid, host, port);
+    int rc = ml307_send_at(s, cmd, resp, sizeof(resp), 5000);
+    if (rc < 0 && strstr(resp, "ERROR") != NULL) {
+        s->sock[sid].state = ML307_SOCK_ALLOCATED;
+        return -2; /* AT command error */
+    }
+
+    /* Wait for +MIPOPEN URC */
+    EventBits_t bits = xEventGroupWaitBits(
+        s->sock[sid].event,
+        SOCK_EVT_CONNECTED | SOCK_EVT_ERROR,
+        pdTRUE, pdFALSE,
+        pdMS_TO_TICKS(timeout_ms));
+
+    if (bits & SOCK_EVT_CONNECTED) {
+        return 0;
+    }
+
+    /* Failed or timeout */
+    s->sock[sid].state = ML307_SOCK_ALLOCATED;
+    if (bits & SOCK_EVT_ERROR) {
+        ESP_LOGE(TAG, "Connect failed: MIPOPEN error=%d", s->sock[sid].open_result);
+        return -3;
+    }
+    ESP_LOGE(TAG, "Connect timeout");
+    return -4;
+}
+
+int ml307_sock_send(ml307_state_t *s, int sid, const uint8_t *data, int len) {
+    if (sid < 0 || sid >= ML307_MAX_SOCKETS) return -1;
+    if (s->sock[sid].state != ML307_SOCK_CONNECTED) return -1;
+
+    /* TX buffer: prefix + hex data + CRLF */
+    char *tx_buf = (char *)malloc(ML307_MAX_SEND_CHUNK * 2 + 64);
+    if (!tx_buf) return -1;
+
+    char resp[128];
+    int total_sent = 0;
+
+    while (total_sent < len) {
+        int chunk = len - total_sent;
+        if (chunk > ML307_MAX_SEND_CHUNK) chunk = ML307_MAX_SEND_CHUNK;
+
+        /* Build AT+MIPSEND=<id>,<len>,<hex>\r\n */
+        int pos = snprintf(tx_buf, 64, "AT+MIPSEND=%d,%d,", sid, chunk);
+        ml307_hex_encode(data + total_sent, chunk, tx_buf + pos);
+        pos += chunk * 2;
+
+        if (s->debug) {
+            ESP_LOGI(TAG, "> AT+MIPSEND=%d,%d,<hex %d chars>", sid, chunk, chunk * 2);
+        }
+
+        /* Send directly to UART (bypass send_at to avoid double-locking) */
+        xSemaphoreTake(s->at_mutex, portMAX_DELAY);
+
+        s->resp_len = 0;
+        s->resp_buf[0] = '\0';
+        xEventGroupClearBits(s->at_event, AT_EVT_RESP_READY);
+        s->at_cmd_echo[0] = '\0'; /* MIPSEND commands are too long to echo-match */
+        s->at_waiting = true;
+
+        /* Write command + CRLF to UART */
+        uart_write_bytes(s->uart_num, tx_buf, pos);
+        uart_write_bytes(s->uart_num, "\r\n", 2);
+
+        /* Calculate timeout based on data size and baud rate */
+        int tx_time_ms = (pos * 10 * 1000) / s->baudrate;
+        int wait_ms = tx_time_ms + 5000;
+
+        EventBits_t bits = xEventGroupWaitBits(
+            s->at_event, AT_EVT_RESP_READY,
+            pdTRUE, pdFALSE,
+            pdMS_TO_TICKS(wait_ms));
+
+        s->at_waiting = false;
+
+        /* Check result */
+        bool ok = (bits & AT_EVT_RESP_READY) && strstr(s->resp_buf, "OK");
+
+        xSemaphoreGive(s->at_mutex);
+
+        if (!ok) {
+            if (total_sent == 0) {
+                free(tx_buf);
+                return -2; /* Send error */
+            }
+            break; /* Partial send */
+        }
+
+        total_sent += chunk;
+    }
+
+    free(tx_buf);
+    return total_sent;
+}
+
+int ml307_sock_recv(ml307_state_t *s, int sid, uint8_t *buf, int maxlen,
+                    int timeout_ms) {
+    if (sid < 0 || sid >= ML307_MAX_SOCKETS) return -1;
+
+    /* Try to read from ring buffer immediately */
+    xSemaphoreTake(s->sock[sid].mutex, portMAX_DELAY);
+    int n = ringbuf_read(&s->sock[sid], buf, maxlen);
+    xSemaphoreGive(s->sock[sid].mutex);
+    if (n > 0) return n;
+
+    /* Check disconnect */
+    if (s->sock[sid].disconnected) return 0;
+
+    /* Non-blocking */
+    if (timeout_ms == 0) return 0;
+
+    /* Block until data or timeout */
+    TickType_t wait = (timeout_ms < 0) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+
+    EventBits_t bits = xEventGroupWaitBits(
+        s->sock[sid].event,
+        SOCK_EVT_DATA | SOCK_EVT_DISCONN,
+        pdTRUE, pdFALSE,
+        wait);
+
+    if (bits & SOCK_EVT_DATA) {
+        xSemaphoreTake(s->sock[sid].mutex, portMAX_DELAY);
+        n = ringbuf_read(&s->sock[sid], buf, maxlen);
+        xSemaphoreGive(s->sock[sid].mutex);
+        if (n > 0) return n;
+    }
+
+    if (s->sock[sid].disconnected) return 0;
+
+    return 0; /* Timeout */
+}
+
+int ml307_sock_available(ml307_state_t *s, int sid) {
+    if (sid < 0 || sid >= ML307_MAX_SOCKETS) return 0;
+    xSemaphoreTake(s->sock[sid].mutex, portMAX_DELAY);
+    int n = ringbuf_available(&s->sock[sid]);
+    xSemaphoreGive(s->sock[sid].mutex);
+    return n;
+}
+
+bool ml307_sock_is_disconnected(ml307_state_t *s, int sid) {
+    if (sid < 0 || sid >= ML307_MAX_SOCKETS) return true;
+    return s->sock[sid].disconnected;
+}
+
+void ml307_sock_close(ml307_state_t *s, int sid) {
+    if (sid < 0 || sid >= ML307_MAX_SOCKETS) return;
+    if (s->sock[sid].state == ML307_SOCK_CONNECTED ||
+        s->sock[sid].state == ML307_SOCK_CONNECTING) {
+        char cmd[24];
+        char resp[64];
+        snprintf(cmd, sizeof(cmd), "AT+MIPCLOSE=%d", sid);
+        ml307_send_at(s, cmd, resp, sizeof(resp), 5000);
+        /* Ignore errors (551 = already disconnected) */
+    }
+    ml307_sock_free(s, sid);
+}
