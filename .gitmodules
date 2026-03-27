@@ -74,9 +74,6 @@
 [submodule "lib/alif-security-toolkit"]
 	path = lib/alif-security-toolkit
 	url = https://github.com/micropython/alif-security-toolkit.git
-[submodule "ports/esp32/components/esp-ml307"]
-	path = ports/esp32/components/esp-ml307
-	url = https://github.com/78/esp-ml307.git
 [submodule "modules/micropython-camera-API"]
 	path = modules/micropython-camera-API
 	url = https://github.com/cnadler86/micropython-camera-API.git
