@@ -269,17 +269,14 @@ static void ml307_at_task(void *arg) {
     uint8_t chunk[512];
 
     while (s->task_running) {
-        int len = uart_read_bytes(s->uart_num, chunk, sizeof(chunk),
-                                  pdMS_TO_TICKS(50));
+        int len = uart_read_bytes(s->uart_num, chunk, sizeof(chunk), 1);
         if (len > 0) {
             for (int i = 0; i < len; i++) {
                 process_byte(s, chunk[i]);
             }
+            continue;
         }
-        /* Yield CPU to let lower-priority tasks (MicroPython) run.
-         * Without this, our high-priority task starves the main task
-         * because uart_read_bytes holds the UART rx_mux. */
-        vTaskDelay(1);
+        taskYIELD();
     }
     vTaskDelete(NULL);
 }
@@ -585,6 +582,13 @@ int ml307_init(ml307_state_t *s, int tx_pin, int rx_pin, int baudrate,
         return -1;
     }
 
+    /* Enable UART RX timeout interrupt.
+     * Without this, uart_read_bytes() only fires on RX FIFO full (120 bytes),
+     * causing short AT responses like "OK\r\n" (4 bytes) to wait the full
+     * uart_read_bytes() timeout instead of returning immediately.
+     * 10 symbol periods at 921600 baud = ~0.1ms idle time before interrupt. */
+    uart_set_rx_timeout(s->uart_num, 10);
+
     /* Start background task */
     ML307_LOGF("[ML307] Starting background AT task...\n");
     s->task_running = true;
@@ -776,9 +780,11 @@ int ml307_sock_send(ml307_state_t *s, int sid, const uint8_t *data, int len) {
         uart_write_bytes(s->uart_num, tx_buf, pos);
         uart_write_bytes(s->uart_num, "\r\n", 2);
 
-        /* Calculate timeout based on data size and baud rate */
+        /* Calculate timeout based on data size and baud rate.
+         * tx_time covers UART transmission; add small margin for modem processing.
+         * With proper UART RX interrupt, response comes back in ~1-2ms. */
         int tx_time_ms = (pos * 10 * 1000) / s->baudrate;
-        int wait_ms = tx_time_ms + 5000;
+        int wait_ms = tx_time_ms + 500;
 
         EventBits_t bits = xEventGroupWaitBits(
             s->at_event, AT_EVT_RESP_READY,
