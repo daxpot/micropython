@@ -363,15 +363,15 @@ static bool try_baudrate(ml307_state_t *s, int baud) {
 static int init_modem(ml307_state_t *s, int target_baud, const char *apn) {
     char resp[256];
 
-    ML307_LOGF("[ML307] Auto-detecting baudrate (target=%d)...\n", target_baud);
+    // ML307_LOGF("[ML307] Auto-detecting baudrate (target=%d)...\n", target_baud);
 
     /* Auto-detect baudrate and switch to target */
     bool found_target = try_baudrate(s, target_baud);
 
-    ML307_LOGF("[ML307] Target baud result=%d\n", found_target);
+    // ML307_LOGF("[ML307] Target baud result=%d\n", found_target);
 
     if (!found_target) {
-        ML307_LOGF("[ML307] Trying 115200 baud...\n");
+        // ML307_LOGF("[ML307] Trying 115200 baud...\n");
 
         if (!try_baudrate(s, 115200)) {
             ML307_LOGF("[ML307] ERROR: Modem not responding!\n");
@@ -379,7 +379,7 @@ static int init_modem(ml307_state_t *s, int target_baud, const char *apn) {
         }
 
         /* Switch to target baudrate */
-        ML307_LOGF("[ML307] Found at 115200, switching to %d...\n", target_baud);
+        // ML307_LOGF("[ML307] Found at 115200, switching to %d...\n", target_baud);
         if (target_baud != 115200) {
             char cmd[32];
             snprintf(cmd, sizeof(cmd), "AT+IPR=%d", target_baud);
@@ -390,19 +390,19 @@ static int init_modem(ml307_state_t *s, int target_baud, const char *apn) {
                 ML307_LOGF("[ML307] ERROR: Failed to switch baud!\n");
                 return -1;
             }
-            ML307_LOGF("[ML307] Switched to %d baud OK\n", target_baud);
+            // ML307_LOGF("[ML307] Switched to %d baud OK\n", target_baud);
         }
     } else {
-        ML307_LOGF("[ML307] Modem responding at %d baud\n", target_baud);
+        // ML307_LOGF("[ML307] Modem responding at %d baud\n", target_baud);
     }
 
     /* Disable echo, enable verbose errors */
-    ML307_LOGF("[ML307] Configuring modem...\n");
+    // ML307_LOGF("[ML307] Configuring modem...\n");
     send_at_ok(s, "ATE0", 1000);
     send_at_ok(s, "AT+CMEE=2", 1000);
 
     /* Cleanup any leftover sockets */
-    ML307_LOGF("[ML307] Cleaning up old sockets...\n");
+    // ML307_LOGF("[ML307] Cleaning up old sockets...\n");
     for (int i = 0; i < ML307_MAX_SOCKETS; i++) {
         char cmd[24];
         snprintf(cmd, sizeof(cmd), "AT+MIPCLOSE=%d", i);
@@ -410,23 +410,23 @@ static int init_modem(ml307_state_t *s, int target_baud, const char *apn) {
     }
 
     /* Check SIM card */
-    ML307_LOGF("[ML307] Checking SIM card...\n");
+    // ML307_LOGF("[ML307] Checking SIM card...\n");
 
     if (ml307_send_at(s, "AT+CPIN?", resp, sizeof(resp), 5000) != 0 ||
         strstr(resp, "READY") == NULL) {
         ML307_LOGF("[ML307] ERROR: SIM not ready: %s\n", resp);
         return -2;
     }
-    ML307_LOGF("[ML307] SIM OK\n");
+    // ML307_LOGF("[ML307] SIM OK\n");
 
     /* Check signal strength */
-    ML307_LOGF("[ML307] Checking signal...\n");
+    // ML307_LOGF("[ML307] Checking signal...\n");
 
     if (ml307_send_at(s, "AT+CSQ", resp, sizeof(resp), 3000) == 0) {
         char *p = strstr(resp, "+CSQ:");
         if (p) {
             s->csq = atoi(p + 5);
-            ML307_LOGF("[ML307] Signal CSQ=%d\n", s->csq);
+            // ML307_LOGF("[ML307] Signal CSQ=%d\n", s->csq);
             if (s->csq < 5 || s->csq == 99) {
                 ML307_LOGF("[ML307] ERROR: Weak signal CSQ=%d\n", s->csq);
                 return -3;
@@ -435,7 +435,7 @@ static int init_modem(ml307_state_t *s, int target_baud, const char *apn) {
     }
 
     /* Wait for 4G registration */
-    ML307_LOGF("[ML307] Waiting for 4G registration...\n");
+    // ML307_LOGF("[ML307] Waiting for 4G registration...\n");
 
     s->registered = false;
     for (int i = 0; i < 30; i++) {
@@ -448,13 +448,13 @@ static int init_modem(ml307_state_t *s, int target_baud, const char *apn) {
                     int stat = atoi(p + 1);
                     if (stat == 1 || stat == 5) {
                         s->registered = true;
-                        ML307_LOGF("[ML307] 4G registered (stat=%d)\n", stat);
+                        // ML307_LOGF("[ML307] 4G registered (stat=%d)\n", stat);
                         break;
                     }
                 }
             }
         }
-        ML307_LOGF(".");
+        // ML307_LOGF(".");
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
     if (!s->registered) {
@@ -463,7 +463,7 @@ static int init_modem(ml307_state_t *s, int target_baud, const char *apn) {
     }
 
     /* Set APN and activate PDP */
-    ML307_LOGF("[ML307] Setting APN and activating PDP...\n");
+    // ML307_LOGF("[ML307] Setting APN and activating PDP...\n");
 
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", apn);
@@ -497,7 +497,7 @@ static int init_modem(ml307_state_t *s, int target_baud, const char *apn) {
     }
 
     s->initialized = true;
-    ML307_LOGF("[ML307] Init complete!\n");
+    // ML307_LOGF("[ML307] Init complete!\n");
     return 0;
 }
 
@@ -513,7 +513,7 @@ int ml307_init(ml307_state_t *s, int tx_pin, int rx_pin, int baudrate,
     s->debug = debug;
 
     /* Create synchronization primitives */
-    ML307_LOGF("[ML307] Creating sync primitives...\n");
+    // ML307_LOGF("[ML307] Creating sync primitives...\n");
     s->at_mutex = xSemaphoreCreateMutex();
     s->at_event = xEventGroupCreate();
     if (!s->at_mutex || !s->at_event) {
@@ -522,7 +522,7 @@ int ml307_init(ml307_state_t *s, int tx_pin, int rx_pin, int baudrate,
     }
 
     /* Initialize socket slots */
-    ML307_LOGF("[ML307] Allocating socket buffers...\n");
+    // ML307_LOGF("[ML307] Allocating socket buffers...\n");
     for (int i = 0; i < ML307_MAX_SOCKETS; i++) {
         s->sock[i].state = ML307_SOCK_FREE;
         s->sock[i].rx_buf = (uint8_t *)malloc(ML307_SOCK_RXBUF_SIZE);
@@ -545,8 +545,8 @@ int ml307_init(ml307_state_t *s, int tx_pin, int rx_pin, int baudrate,
     }
 
     /* Setup UART */
-    ML307_LOGF("[ML307] Setting up UART%d (tx=%d, rx=%d)...\n",
-           s->uart_num, tx_pin, rx_pin);
+    // ML307_LOGF("[ML307] Setting up UART%d (tx=%d, rx=%d)...\n",
+    //        s->uart_num, tx_pin, rx_pin);
 
     /* Delete UART driver if already installed (e.g. from previous run or machine.UART) */
     uart_driver_delete(s->uart_num);
@@ -590,7 +590,7 @@ int ml307_init(ml307_state_t *s, int tx_pin, int rx_pin, int baudrate,
     uart_set_rx_timeout(s->uart_num, 10);
 
     /* Start background task */
-    ML307_LOGF("[ML307] Starting background AT task...\n");
+    // ML307_LOGF("[ML307] Starting background AT task...\n");
     s->task_running = true;
     BaseType_t ret = xTaskCreatePinnedToCore(
         ml307_at_task, "ml307_at",
@@ -607,7 +607,7 @@ int ml307_init(ml307_state_t *s, int tx_pin, int rx_pin, int baudrate,
     }
 
     /* Initialize modem (auto-baud, SIM, 4G, APN) */
-    ML307_LOGF("[ML307] Starting modem init...\n");
+    // ML307_LOGF("[ML307] Starting modem init...\n");
     int rc = init_modem(s, baudrate, apn);
     if (rc != 0) {
         ML307_LOGF("[ML307] ERROR: Modem init failed: %d\n", rc);

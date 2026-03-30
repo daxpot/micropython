@@ -186,20 +186,6 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 0.15.2
-  espressif/i2c_bus:
-    component_hash: 804ec068d163570fd367b279a310ca383484630d2310c586b50def0bcf21de13
-    dependencies:
-    - name: espressif/cmake_utilities
-      registry_url: https://components.espressif.com
-      require: private
-      version: '*'
-    - name: idf
-      require: private
-      version: '>=4.0'
-    source:
-      registry_url: https://components.espressif.com
-      type: service
-    version: 1.5.1
   espressif/mdns:
     component_hash: 46ee81d32fbf850462d8af1e83303389602f6a6a9eddd2a55104cb4c063858ed
     dependencies:
@@ -229,26 +215,6 @@ dependencies:
     source:
       type: idf
     version: 5.5.2
-  waveshare/esp_lcd_jd9365_10_1:
-    component_hash: 6c1336b93a37df2b5be42c49c4c364d0bacdbf96f053a934f881349457fac679
-    dependencies:
-    - name: espressif/cmake_utilities
-      registry_url: https://components.espressif.com
-      require: private
-      version: 0.*
-    - name: espressif/i2c_bus
-      registry_url: https://components.espressif.com
-      require: private
-      version: ^1.3.0
-    - name: idf
-      require: private
-      version: '>=5.3'
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    targets:
-    - esp32p4
-    version: 1.0.4
 direct_dependencies:
 - 78/esp-opus-encoder
 - espressif/esp-sr
@@ -260,7 +226,6 @@ direct_dependencies:
 - espressif/mdns
 - espressif/tinyusb
 - idf
-- waveshare/esp_lcd_jd9365_10_1
-manifest_hash: 4561b1c7743abfa2f594851ca5f7cc00ca073a8665328b644eeadee17ab75512
+manifest_hash: 9c42e3f444d8a2928ba8cd98469f1b16536dc006a7415ee280ff1f81dd3dc0da
 target: esp32p4
 version: 2.0.0

@@ -26,3 +26,21 @@ CONFIG_CAMERA_OV5647=y
 CONFIG_CAMERA_OV5647_AUTO_DETECT_MIPI_INTERFACE_SENSOR=y
 CONFIG_CAMERA_OV5647_MIPI_RAW8_800X640_50FPS=y
 CONFIG_CAMERA_OV5647_CSI_LINESYNC_ENABLE=y
+
+# ESP-SR Configuration for MicroPython
+# This file should be appended to sdkconfig.defaults or used with menuconfig
+
+# Enable ESP-SR components
+CONFIG_SR_MN_EN_NONE=y
+CONFIG_SR_MN_CN_NONE=y
+
+# WakeNet model selection - xiaoyutongxue (小宇同学)
+CONFIG_SR_WN_WN9_XIAOYUTONGXUE_TTS2=y
+
+# Disable other WakeNet models to save space
+CONFIG_SR_WN_WN9_HILEXIN=n
+CONFIG_SR_WN_WN9_HIESP=n
+CONFIG_SR_WN_WN9_NIHAOXIAOZHI=n
+
+# Load model from flash partition instead of embedding in firmware
+CONFIG_SR_MODEL_LOAD_FROM_PARTITION=y
