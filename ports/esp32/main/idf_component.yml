@@ -35,5 +35,10 @@ dependencies:
     git: https://github.com/cnadler86/esp32-camera.git
   # Opus encoder/decoder via esp-opus-encoder (78/xiaoxia)
   78/esp-opus-encoder: "^2.4.1"
+  # UART UHCI DMA controller for ML307 4G modem (78/xiaoxia)
+  78/uart-uhci:
+    version: "^0.2.1"
+    rules:
+      - if: "target in [esp32s3, esp32c3, esp32c6, esp32p4]"
   idf:
     version: ">=5.2.0"

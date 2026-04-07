@@ -13,9 +13,9 @@ except OSError:
 gc.collect()
 
 # Auto-start BLE UART REPL for Mixly wireless connectivity
-try:
-    import mixly_ble
+# try:
+#     import mixly_ble
 
-    mixly_ble.start()
-except Exception:
-    pass
+#     mixly_ble.start()
+# except Exception:
+#     pass
