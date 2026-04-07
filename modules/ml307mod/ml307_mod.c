@@ -78,6 +78,7 @@ static mp_obj_t ml307_mod_init(size_t n_args, const mp_obj_t *pos_args,
     int rc = ml307_init(&ml307_state, tx, rx, baud, apn, debug);
 
     if (rc != 0) {
+        /* ml307_init already calls deinit on failure, so state is clean */
         mp_raise_msg_varg(&mp_type_OSError,
             MP_ERROR_TEXT("ML307 init failed: %d"), rc);
     }
@@ -271,23 +272,32 @@ static mp_obj_t ml307_mod_at_cmd(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(ml307_mod_at_cmd_obj, 1, 2, ml307_mod_at_cmd);
 
+/* ---- is_overflow(sid) → bool ---- */
+static mp_obj_t ml307_mod_is_overflow(mp_obj_t sid_obj) {
+    check_init();
+    return mp_obj_new_bool(
+        ml307_sock_check_overflow(&ml307_state, mp_obj_get_int(sid_obj)));
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(ml307_mod_is_overflow_obj, ml307_mod_is_overflow);
+
 /* ---- Module Definition ---- */
 
 static const mp_rom_map_elem_t ml307_module_globals_table[] = {
-    { MP_ROM_QSTR(MP_QSTR___name__),        MP_ROM_QSTR(MP_QSTR__ml307) },
-    { MP_ROM_QSTR(MP_QSTR_init),            MP_ROM_PTR(&ml307_mod_init_obj) },
-    { MP_ROM_QSTR(MP_QSTR_deinit),          MP_ROM_PTR(&ml307_mod_deinit_obj) },
-    { MP_ROM_QSTR(MP_QSTR_status),          MP_ROM_PTR(&ml307_mod_status_obj) },
-    { MP_ROM_QSTR(MP_QSTR_is_connected),    MP_ROM_PTR(&ml307_mod_is_connected_obj) },
-    { MP_ROM_QSTR(MP_QSTR_alloc),           MP_ROM_PTR(&ml307_mod_alloc_obj) },
-    { MP_ROM_QSTR(MP_QSTR_free),            MP_ROM_PTR(&ml307_mod_free_obj) },
-    { MP_ROM_QSTR(MP_QSTR_connect),         MP_ROM_PTR(&ml307_mod_connect_obj) },
-    { MP_ROM_QSTR(MP_QSTR_send),            MP_ROM_PTR(&ml307_mod_send_obj) },
-    { MP_ROM_QSTR(MP_QSTR_recv),            MP_ROM_PTR(&ml307_mod_recv_obj) },
-    { MP_ROM_QSTR(MP_QSTR_available),       MP_ROM_PTR(&ml307_mod_available_obj) },
-    { MP_ROM_QSTR(MP_QSTR_is_disconnected), MP_ROM_PTR(&ml307_mod_is_disconnected_obj) },
-    { MP_ROM_QSTR(MP_QSTR_close),           MP_ROM_PTR(&ml307_mod_close_obj) },
-    { MP_ROM_QSTR(MP_QSTR_at_cmd),          MP_ROM_PTR(&ml307_mod_at_cmd_obj) },
+    { MP_ROM_QSTR(MP_QSTR___name__),           MP_ROM_QSTR(MP_QSTR__ml307) },
+    { MP_ROM_QSTR(MP_QSTR_init),               MP_ROM_PTR(&ml307_mod_init_obj) },
+    { MP_ROM_QSTR(MP_QSTR_deinit),             MP_ROM_PTR(&ml307_mod_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR_status),             MP_ROM_PTR(&ml307_mod_status_obj) },
+    { MP_ROM_QSTR(MP_QSTR_is_connected),       MP_ROM_PTR(&ml307_mod_is_connected_obj) },
+    { MP_ROM_QSTR(MP_QSTR_alloc),              MP_ROM_PTR(&ml307_mod_alloc_obj) },
+    { MP_ROM_QSTR(MP_QSTR_free),               MP_ROM_PTR(&ml307_mod_free_obj) },
+    { MP_ROM_QSTR(MP_QSTR_connect),            MP_ROM_PTR(&ml307_mod_connect_obj) },
+    { MP_ROM_QSTR(MP_QSTR_send),               MP_ROM_PTR(&ml307_mod_send_obj) },
+    { MP_ROM_QSTR(MP_QSTR_recv),               MP_ROM_PTR(&ml307_mod_recv_obj) },
+    { MP_ROM_QSTR(MP_QSTR_available),          MP_ROM_PTR(&ml307_mod_available_obj) },
+    { MP_ROM_QSTR(MP_QSTR_is_disconnected),    MP_ROM_PTR(&ml307_mod_is_disconnected_obj) },
+    { MP_ROM_QSTR(MP_QSTR_close),              MP_ROM_PTR(&ml307_mod_close_obj) },
+    { MP_ROM_QSTR(MP_QSTR_at_cmd),             MP_ROM_PTR(&ml307_mod_at_cmd_obj) },
+    { MP_ROM_QSTR(MP_QSTR_is_overflow),        MP_ROM_PTR(&ml307_mod_is_overflow_obj) },
 };
 static MP_DEFINE_CONST_DICT(ml307_module_globals, ml307_module_globals_table);
 

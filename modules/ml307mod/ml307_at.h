@@ -1,6 +1,10 @@
 /*
  * ML307R AT Command Engine
- * UART communication, AT response parsing, URC dispatch, socket management.
+ * UART communication via UHCI DMA (ESP32-S3/C3/C6/P4) or standard UART driver.
+ * AT response parsing, URC dispatch, socket management.
+ * 
+ * When ML307_USE_UHCI_DMA=1:
+ *   UHCI DMA → ISR callback → queue → task → line_buf → parse
  */
 
 #ifndef ML307_AT_H
@@ -12,16 +16,30 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "driver/uart.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* Limits */
 #define ML307_MAX_SOCKETS       6
 #define ML307_SOCK_RXBUF_SIZE   8192    /* Ring buffer per socket */
 #define ML307_LINE_BUF_SIZE     4096    /* Max AT line length (MIPURC can be long) */
 #define ML307_RESP_BUF_SIZE     1024    /* AT response accumulator */
-#define ML307_UART_RXBUF_SIZE   16384   /* IDF UART driver RX buffer */
-#define ML307_UART_TXBUF_SIZE   2048    /* IDF UART driver TX buffer */
 #define ML307_MAX_SEND_CHUNK    730     /* Max bytes per MIPSEND (1460/2 for HEX) */
+
+/* Standard UART driver buffer sizes (used when UHCI not available) */
+#define ML307_UART_RXBUF_SIZE   16384
+#define ML307_UART_TXBUF_SIZE   2048
+
+/* UHCI DMA buffer pool configuration */
+#ifdef ML307_USE_UHCI_DMA
+#define ML307_DMA_BUF_COUNT     12      /* Number of DMA buffers */
+#define ML307_DMA_BUF_SIZE      512     /* Size of each DMA buffer */
+#define ML307_RX_QUEUE_DEPTH    16      /* RX data queue depth */
+#endif
 
 /* Socket states */
 #define ML307_SOCK_FREE         0
@@ -38,6 +56,7 @@
 
 /* AT engine event bits */
 #define AT_EVT_RESP_READY       (1 << 0)
+#define AT_EVT_RESP_TRUNCATED   (1 << 1)  /* Response buffer was full */
 
 /* Per-socket state */
 typedef struct {
@@ -46,6 +65,7 @@ typedef struct {
     int rx_head;                    /* Write pointer */
     int rx_tail;                    /* Read pointer */
     bool disconnected;
+    bool overflow;                  /* Set when ring buffer overflow occurred */
     int open_result;                /* MIPOPEN result: -1=pending, 0=ok, >0=error */
     EventGroupHandle_t event;
     SemaphoreHandle_t mutex;        /* Protect ring buffer */
@@ -59,6 +79,17 @@ typedef struct {
     int rx_pin;
     int baudrate;
     bool debug;
+
+#ifdef ML307_USE_UHCI_DMA
+    /* UHCI DMA controller (C++ object, managed as opaque pointer) */
+    void *uhci;                     /* UartUhci* */
+    
+    /* RX data queue (DMA callback → task) */
+    QueueHandle_t rx_queue;
+    
+    /* DMA overflow flag (set by overflow callback) */
+    volatile bool dma_overflow;
+#endif
 
     /* Background task */
     TaskHandle_t task_handle;
@@ -74,6 +105,8 @@ typedef struct {
     char resp_buf[ML307_RESP_BUF_SIZE]; /* Response accumulator */
     int resp_len;
     volatile bool at_waiting;           /* True when waiting for AT response */
+    volatile bool resp_truncated;       /* True if response buffer overflowed */
+    int last_cme_error;                 /* Last +CME ERROR code (-1 = none) */
     char at_cmd_echo[64];              /* Last sent command (for echo skip) */
 
     /* Sockets */
@@ -137,7 +170,19 @@ int ml307_sock_available(ml307_state_t *s, int sid);
 /* Check if peer disconnected. */
 bool ml307_sock_is_disconnected(ml307_state_t *s, int sid);
 
+/* Check if socket had buffer overflow (and clear the flag). */
+bool ml307_sock_check_overflow(ml307_state_t *s, int sid);
+
 /* Close socket. */
 void ml307_sock_close(ml307_state_t *s, int sid);
+
+#ifdef ML307_USE_UHCI_DMA
+/* Check if DMA had overflow (and clear the flag). */
+bool ml307_check_dma_overflow(ml307_state_t *s);
+#endif
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ML307_AT_H */

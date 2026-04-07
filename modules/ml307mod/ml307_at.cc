@@ -1,7 +1,11 @@
 /*
  * ML307R AT Command Engine Implementation
  *
- * Background FreeRTOS task reads UART, parses AT responses and URCs.
+ * When ML307_USE_UHCI_DMA=1:
+ *   UHCI DMA receives data → ISR callback → FreeRTOS queue → background task
+ * Otherwise:
+ *   Standard UART driver with uart_read_bytes polling
+ * 
  * Socket data arrives via +MIPURC, is HEX-decoded, and stored in ring buffers.
  * Python thread synchronizes via EventGroups (no polling needed).
  */
@@ -16,6 +20,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/idf_additions.h"
+
+#ifdef ML307_USE_UHCI_DMA
+#include "uart_uhci.h"
+#endif
 
 static const char *TAG = "ML307";
 
@@ -41,12 +49,15 @@ static inline int ringbuf_available(ml307_sock_t *sk) {
 }
 
 static void ringbuf_write(ml307_sock_t *sk, const uint8_t *data, int len) {
+    /* Check if there's enough space; if not, discard entire frame to avoid
+     * partial/corrupt data (borrowed from esp-ml307's approach) */
+    int free_space = ML307_SOCK_RXBUF_SIZE - 1 - ringbuf_available(sk);
+    if (len > free_space) {
+        sk->overflow = true;  /* Signal overflow to upper layer */
+        return;  /* Discard entire frame rather than corrupt partial data */
+    }
     for (int i = 0; i < len; i++) {
         int next = (sk->rx_head + 1) % ML307_SOCK_RXBUF_SIZE;
-        if (next == sk->rx_tail) {
-            /* Buffer full — drop oldest byte */
-            sk->rx_tail = (sk->rx_tail + 1) % ML307_SOCK_RXBUF_SIZE;
-        }
         sk->rx_buf[sk->rx_head] = data[i];
         sk->rx_head = next;
     }
@@ -99,7 +110,14 @@ static void handle_mipurc(ml307_state_t *s, const char *args) {
         if (*p == ',') p++;
 
         /* Decode hex data directly into ring buffer */
-        int hex_len = strlen(p);
+        /* Compute safe hex_len bounded by line_buf end to prevent overread */
+        const char *line_end = s->line_buf + ML307_LINE_BUF_SIZE;
+        int hex_len = 0;
+        const char *hp = p;
+        while (hp < line_end && *hp && *hp != '\r' && *hp != '\n') {
+            hp++;
+            hex_len++;
+        }
         if (hex_len < 2) return;
 
         /* Temporary decode buffer on stack (max ~730 bytes per URC) */
@@ -224,12 +242,24 @@ static void process_line(ml307_state_t *s, const char *line) {
             memcpy(s->resp_buf + s->resp_len, line, line_len);
             s->resp_len += line_len;
             s->resp_buf[s->resp_len] = '\0';
+        } else {
+            /* Response buffer full — mark truncation */
+            s->resp_truncated = true;
         }
 
         /* Check for end-of-response markers */
         if (strcmp(line, "OK") == 0 ||
             strcmp(line, "ERROR") == 0 ||
-            strncmp(line, "+CME ERROR:", 11) == 0) {
+            strncmp(line, "+CME ERROR:", 11) == 0 ||
+            strncmp(line, "+CMS ERROR:", 11) == 0) {
+            /* Parse CME/CMS error code for callers */
+            if (strncmp(line, "+CME ERROR:", 11) == 0) {
+                s->last_cme_error = atoi(line + 11);
+            } else if (strncmp(line, "+CMS ERROR:", 11) == 0) {
+                s->last_cme_error = atoi(line + 11);
+            } else {
+                s->last_cme_error = -1;
+            }
             xEventGroupSetBits(s->at_event, AT_EVT_RESP_READY);
         }
     }
@@ -264,6 +294,88 @@ static void process_byte(ml307_state_t *s, uint8_t ch) {
 
 /* ---- Background Task ---- */
 
+#ifdef ML307_USE_UHCI_DMA
+
+/* RX data item for queue */
+struct ml307_rx_item_t {
+    uint8_t *data;
+    size_t size;
+    UartUhci::RxBuffer *buffer;  /* For returning to DMA pool */
+};
+
+/* DMA RX callback (ISR context - must be fast!) */
+static bool IRAM_ATTR ml307_dma_rx_callback(const UartUhci::RxEventData& data, void* user_data) {
+    ml307_state_t *s = static_cast<ml307_state_t*>(user_data);
+    
+    ml307_rx_item_t item = {
+        .data = data.buffer->data,
+        .size = data.recv_size,
+        .buffer = data.buffer,
+    };
+    
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    if (xQueueSendFromISR(s->rx_queue, &item, &xHigherPriorityTaskWoken) != pdTRUE) {
+        /* Queue full - return buffer immediately to avoid DMA stall */
+        static_cast<UartUhci*>(s->uhci)->ReturnBuffer(data.buffer);
+    }
+    
+    return xHigherPriorityTaskWoken == pdTRUE;
+}
+
+/* DMA overflow callback (ISR context) */
+static bool IRAM_ATTR ml307_dma_overflow_callback(void* user_data) {
+    ml307_state_t *s = static_cast<ml307_state_t*>(user_data);
+    s->dma_overflow = true;
+    return false;
+}
+
+/* Background task for UHCI DMA mode */
+static void ml307_at_task(void *arg) {
+    ml307_state_t *s = static_cast<ml307_state_t*>(arg);
+    ml307_rx_item_t item;
+    UartUhci *uhci = static_cast<UartUhci*>(s->uhci);
+    
+    ML307_LOGF("[ML307] DMA task started, uhci=%p, queue=%p\n", uhci, s->rx_queue);
+    
+    static int debug_count = 0;
+    while (s->task_running) {
+        /* Fix 6: Check DMA overflow atomically and notify all connected sockets */
+        bool had_overflow = __atomic_exchange_n(&s->dma_overflow, false, __ATOMIC_SEQ_CST);
+        if (had_overflow) {
+            ESP_LOGW(TAG, "DMA overflow detected — disconnecting active sockets");
+            for (int i = 0; i < ML307_MAX_SOCKETS; i++) {
+                if (s->sock[i].state == ML307_SOCK_CONNECTED) {
+                    s->sock[i].disconnected = true;
+                    s->sock[i].overflow = true;
+                    xEventGroupSetBits(s->sock[i].event,
+                        SOCK_EVT_DISCONN | SOCK_EVT_DATA | SOCK_EVT_ERROR);
+                }
+            }
+        }
+
+        /* Wait for data from DMA queue */
+        if (xQueueReceive(s->rx_queue, &item, pdMS_TO_TICKS(10)) == pdTRUE) {
+            /* Debug: log first few receives */
+            if (debug_count < 5) {
+                ML307_LOGF("[ML307] DMA RX: %d bytes\n", (int)item.size);
+                debug_count++;
+            }
+            
+            /* Process received bytes */
+            for (size_t i = 0; i < item.size; i++) {
+                process_byte(s, item.data[i]);
+            }
+            
+            /* Return buffer to DMA pool immediately */
+            uhci->ReturnBuffer(item.buffer);
+        }
+    }
+    ML307_LOGF("[ML307] DMA task exiting\n");
+    vTaskDelete(NULL);
+}
+
+#else /* Standard UART mode */
+
 static void ml307_at_task(void *arg) {
     ml307_state_t *s = (ml307_state_t *)arg;
     uint8_t chunk[512];
@@ -281,6 +393,32 @@ static void ml307_at_task(void *arg) {
     vTaskDelete(NULL);
 }
 
+#endif /* ML307_USE_UHCI_DMA */
+
+/* ---- UART Transmit Helper ---- */
+
+static int ml307_uart_write(ml307_state_t *s, const void *data, size_t len) {
+#ifdef ML307_USE_UHCI_DMA
+    UartUhci *uhci = static_cast<UartUhci*>(s->uhci);
+    if (uhci) {
+        esp_err_t err = uhci->Transmit(static_cast<const uint8_t*>(data), len);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "UHCI Transmit failed: %d", err);
+            return -1;
+        }
+        return 0;
+    }
+    return -1;
+#else
+    int written = uart_write_bytes(s->uart_num, data, len);
+    if (written < 0 || (size_t)written != len) {
+        ESP_LOGE(TAG, "uart_write_bytes failed: wrote %d/%d", written, (int)len);
+        return -1;
+    }
+    return 0;
+#endif
+}
+
 /* ---- AT Command Send ---- */
 
 int ml307_send_at(ml307_state_t *s, const char *cmd,
@@ -290,6 +428,8 @@ int ml307_send_at(ml307_state_t *s, const char *cmd,
     /* Prepare response state */
     s->resp_len = 0;
     s->resp_buf[0] = '\0';
+    s->resp_truncated = false;
+    s->last_cme_error = -1;
     xEventGroupClearBits(s->at_event, AT_EVT_RESP_READY);
 
     /* Store command for echo detection */
@@ -298,8 +438,13 @@ int ml307_send_at(ml307_state_t *s, const char *cmd,
     s->at_waiting = true;
 
     /* Send command + CRLF */
-    uart_write_bytes(s->uart_num, cmd, strlen(cmd));
-    uart_write_bytes(s->uart_num, "\r\n", 2);
+    if (ml307_uart_write(s, cmd, strlen(cmd)) < 0 ||
+        ml307_uart_write(s, "\r\n", 2) < 0) {
+        s->at_waiting = false;
+        s->at_cmd_echo[0] = '\0';
+        xSemaphoreGive(s->at_mutex);
+        return -3; /* UART write error */
+    }
 
     /* Wait for response */
     EventBits_t bits = xEventGroupWaitBits(
@@ -325,6 +470,9 @@ int ml307_send_at(ml307_state_t *s, const char *cmd,
             if (len >= resp_size) len = resp_size - 1;
             memcpy(resp, s->resp_buf, len);
             resp[len] = '\0';
+        }
+        if (s->resp_truncated) {
+            ESP_LOGW(TAG, "AT response truncated (>%d bytes)", ML307_RESP_BUF_SIZE);
         }
         result = (strstr(s->resp_buf, "OK") != NULL) ? 0 : -2;
     }
@@ -409,36 +557,45 @@ static int init_modem(ml307_state_t *s, int target_baud, const char *apn) {
         ml307_send_at(s, cmd, resp, sizeof(resp), 1000);
     }
 
-    /* Check SIM card */
-    // ML307_LOGF("[ML307] Checking SIM card...\n");
+    /* Check SIM card - retry a few times as it may take time to initialize */
+    ML307_LOGF("[ML307] Checking SIM card...\n");
 
-    if (ml307_send_at(s, "AT+CPIN?", resp, sizeof(resp), 5000) != 0 ||
-        strstr(resp, "READY") == NULL) {
-        ML307_LOGF("[ML307] ERROR: SIM not ready: %s\n", resp);
+    bool sim_ready = false;
+    for (int i = 0; i < 10; i++) {  // Retry up to 10 times (10 seconds)
+        if (ml307_send_at(s, "AT+CPIN?", resp, sizeof(resp), 5000) == 0 &&
+            strstr(resp, "READY") != NULL) {
+            sim_ready = true;
+            break;
+        }
+        ML307_LOGF("[ML307] SIM not ready yet (%d/10): %s\n", i + 1, resp);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    if (!sim_ready) {
+        ML307_LOGF("[ML307] ERROR: SIM not ready after 10 attempts\n");
         return -2;
     }
-    // ML307_LOGF("[ML307] SIM OK\n");
+    ML307_LOGF("[ML307] SIM OK\n");
 
     /* Check signal strength */
-    // ML307_LOGF("[ML307] Checking signal...\n");
+    ML307_LOGF("[ML307] Checking signal...\n");
 
     if (ml307_send_at(s, "AT+CSQ", resp, sizeof(resp), 3000) == 0) {
         char *p = strstr(resp, "+CSQ:");
         if (p) {
             s->csq = atoi(p + 5);
-            // ML307_LOGF("[ML307] Signal CSQ=%d\n", s->csq);
+            ML307_LOGF("[ML307] Signal CSQ=%d\n", s->csq);
             if (s->csq < 5 || s->csq == 99) {
-                ML307_LOGF("[ML307] ERROR: Weak signal CSQ=%d\n", s->csq);
-                return -3;
+                ML307_LOGF("[ML307] WARNING: Weak signal CSQ=%d, continuing anyway...\n", s->csq);
+                // Don't fail on weak signal - let registration try
             }
         }
     }
 
     /* Wait for 4G registration */
-    // ML307_LOGF("[ML307] Waiting for 4G registration...\n");
+    ML307_LOGF("[ML307] Waiting for 4G registration...\n");
 
     s->registered = false;
-    for (int i = 0; i < 30; i++) {
+    for (int i = 0; i < 60; i++) {  // Increase to 60 seconds
         if (ml307_send_at(s, "AT+CEREG?", resp, sizeof(resp), 3000) == 0) {
             char *p = strstr(resp, "+CEREG:");
             if (p) {
@@ -446,19 +603,21 @@ static int init_modem(ml307_state_t *s, int target_baud, const char *apn) {
                 p = strchr(p + 7, ',');
                 if (p) {
                     int stat = atoi(p + 1);
+                    if (i % 5 == 0 || stat == 1 || stat == 5) {
+                        ML307_LOGF("[ML307] CEREG stat=%d (%d/60)\n", stat, i + 1);
+                    }
                     if (stat == 1 || stat == 5) {
                         s->registered = true;
-                        // ML307_LOGF("[ML307] 4G registered (stat=%d)\n", stat);
+                        ML307_LOGF("[ML307] 4G registered!\n");
                         break;
                     }
                 }
             }
         }
-        // ML307_LOGF(".");
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
     if (!s->registered) {
-        ML307_LOGF("\n[ML307] ERROR: 4G registration timeout!\n");
+        ML307_LOGF("[ML307] ERROR: 4G registration timeout after 60s!\n");
         return -4;
     }
 
@@ -511,6 +670,7 @@ int ml307_init(ml307_state_t *s, int tx_pin, int rx_pin, int baudrate,
     s->rx_pin = rx_pin;
     s->baudrate = baudrate;
     s->debug = debug;
+    s->last_cme_error = -1;
 
     /* Create synchronization primitives */
     // ML307_LOGF("[ML307] Creating sync primitives...\n");
@@ -534,6 +694,7 @@ int ml307_init(ml307_state_t *s, int tx_pin, int rx_pin, int baudrate,
         s->sock[i].rx_head = 0;
         s->sock[i].rx_tail = 0;
         s->sock[i].disconnected = false;
+        s->sock[i].overflow = false;
         s->sock[i].open_result = -1;
         s->sock[i].event = xEventGroupCreate();
         s->sock[i].mutex = xSemaphoreCreateMutex();
@@ -573,6 +734,59 @@ int ml307_init(ml307_state_t *s, int tx_pin, int rx_pin, int baudrate,
         ml307_deinit(s);
         return -1;
     }
+
+#ifdef ML307_USE_UHCI_DMA
+    /* UHCI DMA mode: do NOT install UART driver (UHCI handles RX, direct FIFO for TX) */
+
+    /* Create RX data queue */
+    s->rx_queue = xQueueCreate(ML307_RX_QUEUE_DEPTH, sizeof(ml307_rx_item_t));
+    if (!s->rx_queue) {
+        ML307_LOGF("[ML307] ERROR: Failed to create RX queue\n");
+        ml307_deinit(s);
+        return -1;
+    }
+
+    /* Initialize UHCI DMA controller */
+    s->uhci = new (std::nothrow) UartUhci();
+    if (!s->uhci) {
+        ML307_LOGF("[ML307] ERROR: Failed to create UartUhci\n");
+        ml307_deinit(s);
+        return -1;
+    }
+
+    UartUhci::Config uhci_cfg = {
+        .uart_port = s->uart_num,
+        .dma_burst_size = 16,
+        .rx_pool = {
+            .buffer_count = ML307_DMA_BUF_COUNT,
+            .buffer_size = ML307_DMA_BUF_SIZE,
+        },
+    };
+    
+    UartUhci *uhci = static_cast<UartUhci*>(s->uhci);
+    err = uhci->Init(uhci_cfg);
+    if (err != ESP_OK) {
+        ML307_LOGF("[ML307] ERROR: UHCI Init failed: %d\n", err);
+        ml307_deinit(s);
+        return -1;
+    }
+
+    /* Register DMA callbacks */
+    uhci->SetRxCallback(ml307_dma_rx_callback, s);
+    uhci->SetOverflowCallback(ml307_dma_overflow_callback, s);
+
+    /* Start DMA receive */
+    err = uhci->StartReceive();
+    if (err != ESP_OK) {
+        ML307_LOGF("[ML307] ERROR: UHCI StartReceive failed: %d\n", err);
+        ml307_deinit(s);
+        return -1;
+    }
+
+    ML307_LOGF("[ML307] UHCI DMA initialized (%d buffers x %d bytes)\n", 
+               ML307_DMA_BUF_COUNT, ML307_DMA_BUF_SIZE);
+
+#else /* Standard UART mode */
     err = uart_driver_install(s->uart_num,
                               ML307_UART_RXBUF_SIZE, ML307_UART_TXBUF_SIZE,
                               0, NULL, 0);
@@ -588,6 +802,7 @@ int ml307_init(ml307_state_t *s, int tx_pin, int rx_pin, int baudrate,
      * uart_read_bytes() timeout instead of returning immediately.
      * 10 symbol periods at 921600 baud = ~0.1ms idle time before interrupt. */
     uart_set_rx_timeout(s->uart_num, 10);
+#endif
 
     /* Start background task */
     // ML307_LOGF("[ML307] Starting background AT task...\n");
@@ -611,7 +826,9 @@ int ml307_init(ml307_state_t *s, int tx_pin, int rx_pin, int baudrate,
     int rc = init_modem(s, baudrate, apn);
     if (rc != 0) {
         ML307_LOGF("[ML307] ERROR: Modem init failed: %d\n", rc);
-        /* Don't deinit — caller may want to retry or debug */
+        /* Fix 7: Clean up on init failure to allow safe re-init.
+         * Previously left resources partially initialized. */
+        ml307_deinit(s);
     }
     return rc;
 }
@@ -621,8 +838,7 @@ void ml307_deinit(ml307_state_t *s) {
     if (s->task_running) {
         s->task_running = false;
         if (s->task_handle) {
-            /* Wait for task to notice task_running=false and exit.
-             * The task checks every 50ms (uart_read_bytes timeout). */
+            /* Wait for task to notice task_running=false and exit. */
             vTaskDelay(pdMS_TO_TICKS(300));
             /* If still alive, force delete */
             eTaskState state = eTaskGetState(s->task_handle);
@@ -633,10 +849,28 @@ void ml307_deinit(ml307_state_t *s) {
         }
     }
 
+#ifdef ML307_USE_UHCI_DMA
+    /* Stop and cleanup UHCI DMA */
+    if (s->uhci) {
+        UartUhci *uhci = static_cast<UartUhci*>(s->uhci);
+        uhci->StopReceive();
+        uhci->Deinit();
+        delete uhci;
+        s->uhci = nullptr;
+    }
+    
+    /* Delete RX queue */
+    if (s->rx_queue) {
+        vQueueDelete(s->rx_queue);
+        s->rx_queue = nullptr;
+    }
+    /* No UART driver to delete in UHCI mode */
+#else
     /* Uninstall UART (safe to call even if not installed) */
     if (s->uart_num > 0) {
         uart_driver_delete(s->uart_num);
     }
+#endif
 
     /* Free socket resources */
     for (int i = 0; i < ML307_MAX_SOCKETS; i++) {
@@ -673,6 +907,7 @@ int ml307_sock_alloc(ml307_state_t *s) {
             s->sock[i].rx_head = 0;
             s->sock[i].rx_tail = 0;
             s->sock[i].disconnected = false;
+            s->sock[i].overflow = false;
             s->sock[i].open_result = -1;
             xEventGroupClearBits(s->sock[i].event,
                 SOCK_EVT_CONNECTED | SOCK_EVT_DISCONN |
@@ -689,6 +924,7 @@ void ml307_sock_free(ml307_state_t *s, int sid) {
     s->sock[sid].rx_head = 0;
     s->sock[sid].rx_tail = 0;
     s->sock[sid].disconnected = false;
+    s->sock[sid].overflow = false;
     s->sock[sid].open_result = -1;
 }
 
@@ -700,13 +936,37 @@ int ml307_sock_connect(ml307_state_t *s, int sid, const char *host, int port,
     char cmd[256];
     char resp[256];
 
+    /* Fix 5: Query MIPSTATE to detect stale modem-side connections
+     * (borrowed from esp-ml307's Connect() pre-check) */
+    snprintf(cmd, sizeof(cmd), "AT+MIPSTATE=%d", sid);
+    if (ml307_send_at(s, cmd, resp, sizeof(resp), 3000) == 0) {
+        /* If modem reports a non-INITIAL state, close it first */
+        if (strstr(resp, "CONNECTED") || strstr(resp, "CONNECTING")) {
+            if (s->debug) {
+                ESP_LOGI(TAG, "Cleaning stale connection on sid=%d", sid);
+            }
+            snprintf(cmd, sizeof(cmd), "AT+MIPCLOSE=%d", sid);
+            ml307_send_at(s, cmd, resp, sizeof(resp), 5000);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
     /* Configure HEX encoding */
     snprintf(cmd, sizeof(cmd), "AT+MIPCFG=\"encoding\",%d,1,1", sid);
-    send_at_ok(s, cmd, 1000);
+    if (send_at_ok(s, cmd, 1000) != 0) {
+        ESP_LOGE(TAG, "Failed to configure encoding for sid=%d", sid);
+        return -2;
+    }
 
-    /* Configure SSL */
+    /* Fix 1: Configure SSL — check result to avoid silent fallback to plaintext */
     snprintf(cmd, sizeof(cmd), "AT+MIPCFG=\"ssl\",%d,%d,0", sid, ssl ? 1 : 0);
-    send_at_ok(s, cmd, 1000);
+    if (send_at_ok(s, cmd, 1000) != 0) {
+        ESP_LOGE(TAG, "SSL config failed for sid=%d (ssl=%d)", sid, ssl);
+        if (ssl) {
+            return -2; /* Fail if SSL was requested but couldn't be configured */
+        }
+        /* Non-SSL: warn but continue */
+    }
 
     /* Open connection */
     s->sock[sid].state = ML307_SOCK_CONNECTING;
@@ -772,13 +1032,24 @@ int ml307_sock_send(ml307_state_t *s, int sid, const uint8_t *data, int len) {
 
         s->resp_len = 0;
         s->resp_buf[0] = '\0';
+        s->resp_truncated = false;
         xEventGroupClearBits(s->at_event, AT_EVT_RESP_READY);
         s->at_cmd_echo[0] = '\0'; /* MIPSEND commands are too long to echo-match */
         s->at_waiting = true;
 
         /* Write command + CRLF to UART */
-        uart_write_bytes(s->uart_num, tx_buf, pos);
-        uart_write_bytes(s->uart_num, "\r\n", 2);
+        int wr1 = ml307_uart_write(s, tx_buf, pos);
+        int wr2 = ml307_uart_write(s, "\r\n", 2);
+
+        if (wr1 < 0 || wr2 < 0) {
+            s->at_waiting = false;
+            xSemaphoreGive(s->at_mutex);
+            if (total_sent == 0) {
+                free(tx_buf);
+                return -2;
+            }
+            break;
+        }
 
         /* Calculate timeout based on data size and baud rate.
          * tx_time covers UART transmission; add small margin for modem processing.
@@ -862,6 +1133,29 @@ bool ml307_sock_is_disconnected(ml307_state_t *s, int sid) {
     if (sid < 0 || sid >= ML307_MAX_SOCKETS) return true;
     return s->sock[sid].disconnected;
 }
+
+bool ml307_sock_check_overflow(ml307_state_t *s, int sid) {
+    if (sid < 0 || sid >= ML307_MAX_SOCKETS) return false;
+    bool was_overflow = s->sock[sid].overflow;
+    s->sock[sid].overflow = false;  /* Clear on read */
+    return was_overflow;
+}
+
+#ifdef ML307_USE_UHCI_DMA
+bool ml307_check_dma_overflow(ml307_state_t *s) {
+    bool was_overflow = s->dma_overflow;
+    s->dma_overflow = false;  /* Clear on read */
+    
+    /* Also check UHCI internal overflow flag */
+    if (s->uhci) {
+        UartUhci *uhci = static_cast<UartUhci*>(s->uhci);
+        if (uhci->CheckAndClearOverflow()) {
+            was_overflow = true;
+        }
+    }
+    return was_overflow;
+}
+#endif
 
 void ml307_sock_close(ml307_state_t *s, int sid) {
     if (sid < 0 || sid >= ML307_MAX_SOCKETS) return;
