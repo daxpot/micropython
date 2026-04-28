@@ -12,10 +12,11 @@ except OSError:
 
 gc.collect()
 
-# Auto-start BLE UART REPL for Mixly wireless connectivity
-# try:
-#     import mixly_ble
+# Mixly BLE: start if enabled in config, monitor BOOT button for double-click
+# toggle during the first few seconds (non-blocking; runs in background thread).
+try:
+    import mixly_ble_boot
 
-#     mixly_ble.start()
-# except Exception:
-#     pass
+    mixly_ble_boot.run()
+except Exception:
+    pass
