@@ -5,3 +5,4 @@ include(${CMAKE_CURRENT_LIST_DIR}/multinetmod/micropython.cmake)
 
 include(${CMAKE_CURRENT_LIST_DIR}/micropython-camera-API/micropython.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/opusmod2/micropython.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/qrscan/micropython.cmake)
