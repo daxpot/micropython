@@ -54,7 +54,7 @@ dependencies:
       type: service
     version: 0.3.1
   espressif/eppp_link:
-    component_hash: 9472e6825f4bb71eca2b39cf1bc92659c1ac60bfd7416560ad033a7dd8641b17
+    component_hash: 04f7f31868b8ae6014c96132740a192d09611a6e46aaa7038c865ffc7e26b38f
     dependencies:
     - name: espressif/esp_serial_slave_link
       registry_url: https://components.espressif.com
@@ -66,7 +66,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com
       type: service
-    version: 1.1.4
+    version: 1.1.5
   espressif/esp-dsp:
     component_hash: 42dce32d46ac93dc11f60d368e29a830e9661c7345d794b8a45c343479cae636
     dependencies:
@@ -77,6 +77,16 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 1.7.0
+  espressif/esp-nn:
+    component_hash: e98a7dd3dfde460b1b4ca982e2ebae0b4831719a8e4659d19c145943deaf682b
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.2'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.2.3
   espressif/esp-sr:
     component_hash: c518b25995cf03021a09442feedb7e40acba9f15d6aa903ebdfe0f657b08197b
     dependencies:
@@ -95,6 +105,20 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 2.4.0
+  espressif/esp-tflite-micro:
+    component_hash: 57aa3889d3c7b7a513f716c2cb8707476a5bf42971d63a6f6d38a5616d862e57
+    dependencies:
+    - name: espressif/esp-nn
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=1.1.1'
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.3.5
   espressif/esp32-camera:
     component_hash: e1681ef2d3ac63433370c55df0db75f4fd713fb26518036184985c2c1cc324b2
     dependencies:
@@ -229,6 +253,7 @@ direct_dependencies:
 - 78/esp-opus-encoder
 - 78/uart-uhci
 - espressif/esp-sr
+- espressif/esp-tflite-micro
 - espressif/esp32-camera
 - espressif/esp_cam_sensor
 - espressif/esp_hosted
@@ -237,6 +262,6 @@ direct_dependencies:
 - espressif/mdns
 - espressif/tinyusb
 - idf
-manifest_hash: b755c23c1037b4e9c1d58f0c0e538fd06ddc6dc838a738d81d36ce8ab295a1c1
+manifest_hash: 6fc45af91a6873998df7e5eb64f39ebc939ba9dd35829d9534faf63428d86117
 target: esp32p4
 version: 2.0.0

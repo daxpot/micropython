@@ -1,13 +1,15 @@
 # This partition table is for devices with 16MiB flash.
-# Includes model partition for esp-sr wake word models.
+# Includes model partition for esp-sr wake word models,
+# and ml_model partition for vision_ml backbone (TFLite Micro).
 
 # Notes: the offset of the partition table itself is set in
 # $IDF_PATH/components/partition_table/Kconfig.projbuild.
-# Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     0x9000,  0x6000,
-phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000,   0x300000,
-font1,    data, fat,     0x3A0000,  0x60000, 
-font2,    data, fat,     0x400000,  0x80000, 
-vfs,      data, fat,     0x480000,  0x780000,
-model,    data, spiffs,  0xC00000,  0x400000,
+# Name,     Type, SubType, Offset,    Size, Flags
+nvs,        data, nvs,     0x9000,    0x6000,
+phy_init,   data, phy,     0xf000,    0x1000,
+factory,    app,  factory, 0x10000,   0x300000,
+font1,      data, fat,     0x3A0000,  0x60000, 
+font2,      data, fat,     0x400000,  0x80000, 
+vfs,        data, fat,     0x480000,  0x780000,
+model,      data, spiffs,  0xC00000,  0x300000,
+ml_model,   data, 0x40,    0xF00000,  0x100000,

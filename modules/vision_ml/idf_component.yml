@@ -1,0 +1,7 @@
+## IDF Component Manager Manifest for vision_ml
+## On-device image classification using MobileNetV1 backbone (TFLite Micro)
+## with a runtime-loadable Dense head trained in the browser.
+dependencies:
+  espressif/esp-tflite-micro: "^1.3.3"
+  idf:
+    version: ">=5.4.0"
