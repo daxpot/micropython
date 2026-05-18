@@ -1,4 +1,57 @@
 dependencies:
+  78/esp-opus:
+    component_hash: 8182b733f071d7bfe1e837f4c9f8649a63e4c937177f089e65772880c02f2e17
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.0.5
+  78/esp-opus-encoder:
+    component_hash: b80e5b6d6dc4bf6b0bf1a3729f52b80500e9e6b1003b3e827b78ba738283a296
+    dependencies:
+    - name: 78/esp-opus
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^1.0.5
+    - name: idf
+      require: private
+      version: '>=5.3'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 2.4.1
+  espressif/esp32-camera:
+    component_hash: e1681ef2d3ac63433370c55df0db75f4fd713fb26518036184985c2c1cc324b2
+    dependencies:
+    - name: idf
+      version: '>=5.1'
+    source:
+      git: https://github.com/cnadler86/esp32-camera.git
+      path: .
+      type: git
+    version: 32a7654a2477a0ce56bbae50a5548ebe48e22f71
+  espressif/esp_new_jpeg:
+    component_hash: 98823384f51ca298e2c9bebacd1c629148e528ed0902d18b16556df151519e68
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32
+    - esp32s2
+    - esp32s3
+    - esp32s31
+    - esp32p4
+    - esp32c2
+    - esp32c3
+    - esp32c5
+    - esp32c6
+    - esp32c61
+    - esp32h4
+    version: 1.0.1
   espressif/lan867x:
     component_hash: 0ff9dae3affeff53811e7c8283e67c6d36dc0c03e3bc5102c0fba629e08bf6c4
     dependencies:
@@ -27,9 +80,12 @@ dependencies:
       type: idf
     version: 5.5.2
 direct_dependencies:
+- 78/esp-opus-encoder
+- espressif/esp32-camera
+- espressif/esp_new_jpeg
 - espressif/lan867x
 - espressif/mdns
 - idf
-manifest_hash: 8bfa19878cfb1e22e7502a3d0493aea0b414158517f558d317cec53f3aa69257
+manifest_hash: a8e99fabb324e2b81d2c9064d0b8aa74bc110d8fec5a1a7238bbee3de39bbc0f
 target: esp32
 version: 2.0.0
