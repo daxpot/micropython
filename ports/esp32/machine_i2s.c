@@ -75,6 +75,7 @@ typedef struct _machine_i2s_obj_t {
     mp_hal_pin_obj_t sck;
     mp_hal_pin_obj_t ws;
     mp_hal_pin_obj_t sd;
+    mp_hal_pin_obj_t mck;
     i2s_dir_t mode;
     i2s_data_bit_width_t bits;
     format_t format;
@@ -341,10 +342,17 @@ static void mp_machine_i2s_init_helper(machine_i2s_obj_t *self, mp_arg_val_t *ar
     int8_t sck = args[ARG_sck].u_obj == MP_OBJ_NULL ? -1 : machine_pin_get_id(args[ARG_sck].u_obj);
     int8_t ws = args[ARG_ws].u_obj == MP_OBJ_NULL ? -1 : machine_pin_get_id(args[ARG_ws].u_obj);
     int8_t sd = args[ARG_sd].u_obj == MP_OBJ_NULL ? -1 : machine_pin_get_id(args[ARG_sd].u_obj);
+    int8_t mck = (args[ARG_mck].u_obj == mp_const_none || args[ARG_mck].u_obj == MP_OBJ_NULL)
+                 ? -1 : machine_pin_get_id(args[ARG_mck].u_obj);
 
     // is Mode valid?
     int8_t mode = args[ARG_mode].u_int;
     bool is_pdm_mode = (mode == MICROPY_PY_MACHINE_I2S_CONSTANT_PDM_RX);
+
+    // mck not supported in PDM mode (PDM uses CLK pin via sck)
+    if (is_pdm_mode && mck != -1) {
+        mp_raise_ValueError(MP_ERROR_TEXT("mck not supported in PDM mode"));
+    }
 
     if ((mode != (MICROPY_PY_MACHINE_I2S_CONSTANT_RX)) &&
         (mode != (MICROPY_PY_MACHINE_I2S_CONSTANT_TX)) &&
@@ -387,6 +395,7 @@ static void mp_machine_i2s_init_helper(machine_i2s_obj_t *self, mp_arg_val_t *ar
     self->sck = sck;
     self->ws = ws;
     self->sd = sd;
+    self->mck = mck;
     self->mode = mode;
     self->bits = bits;
     self->format = format;
@@ -445,7 +454,7 @@ static void mp_machine_i2s_init_helper(machine_i2s_obj_t *self, mp_arg_val_t *ar
             .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(self->rate),
             .slot_cfg = slot_cfg,
             .gpio_cfg = {
-                .mclk = I2S_GPIO_UNUSED,
+                .mclk = (self->mck == -1) ? I2S_GPIO_UNUSED : (gpio_num_t)self->mck,
                 .bclk = self->sck,
                 .ws = self->ws,
                 .invert_flags = {
